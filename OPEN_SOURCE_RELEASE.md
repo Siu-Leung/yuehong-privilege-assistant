@@ -26,5 +26,6 @@ pwsh -NoProfile -File .\tools\verify_public_source.ps1
 - 组合发行版、Stellar 与月虹修改文件：MPL-2.0。
 - Shizuku 兼容层：Apache-2.0。
 - GhostLock：Apache-2.0。
+- KSuRoot 动态载荷组件：Apache-2.0。
 
 完整条款和上游归属见 `LICENSE`、`LICENSES/` 与 `NOTICE.md`。

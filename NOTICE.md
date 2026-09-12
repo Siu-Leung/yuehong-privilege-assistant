@@ -39,4 +39,13 @@ Stellar 保留的 Shizuku AIDL 与兼容层继续遵循 Apache-2.0。完整文�
 
 GhostLock C 核心、Rust 镜像/OTA 提取器、内核偏移表及许可证随源码交付；Android 页面适配位于 `assistant/src/main/java/roro/stellar/yuehong/ghostlock`。完整许可证文本位于 `LICENSES/GhostLock-Apache-2.0.txt`。
 
+## KSuRoot dynamic payload components
+
+- Project: KSuRoot
+- Source: https://github.com/hmascs/KSuRoot/
+- Upstream snapshot: v3.0.2
+- License: Apache License 2.0
+
+GhostLock+KSuRoot 的动态载荷方案仅移植 KSuRoot 的纯 Kotlin `kernelpack` 构建算法和 arm64-v8a 本地动态载荷/执行辅助程序；未移植其 Compose 页面、Provider 或在线下载逻辑。完整许可证文本位于 `LICENSES/Apache-2.0.txt`。
+
 版权归各自贡献者所有。各文件继续适用其原有许可证；本说明不替代许可证正文。

@@ -33,10 +33,11 @@ LICENSES/   第三方许可证文本
 
 `assistant` 是 Android Library，最终由 `manager` 打包成唯一 APK。桌面唯一入口仍是月虹提权助手的 `roro.stellar.yuehong.activities.MainActivity`；Stellar 原管理器首页、更新器入口和安装未知 APK 权限不进入发行 Manifest。
 
-## 上游项目
+## 三个主要上游项目
 
 - [Stellar](https://github.com/roro2239/Stellar)：内置的 Manager、Server 与核心服务框架。
 - [GhostLock-App](https://github.com/YuKongA/ghostlock-app)：GhostLock 原生提权核心、OTA 解析器和内核偏移资源。
+- [KSuRoot](https://github.com/hmascs/KSuRoot/)：动态载荷方案所使用的 KernelPack 算法及 arm64-v8a 本地辅助组件。
 
 其他第三方代码的许可证和归属见 [NOTICE.md](NOTICE.md) 与 [LICENSES](LICENSES)。
 
@@ -111,6 +112,7 @@ out/mapping/mapping-v1.5.3.txt
 - Stellar 与月虹修改文件遵循 MPL-2.0，完整文本位于 [LICENSES/MPL-2.0.txt](LICENSES/MPL-2.0.txt)。
 - Stellar 中源自 Shizuku 的文件保留 Apache-2.0。
 - GhostLock 源码保留 Apache-2.0。
+- KSuRoot 动态载荷组件保留 Apache-2.0。
 
 根目录 [LICENSE](LICENSE) 为 MPL-2.0 完整文本。完整归属与修改说明见 [NOTICE.md](NOTICE.md)，第三方许可文本见 [LICENSES](LICENSES)。发布前可运行 `tools/verify_public_source.ps1` 检查配置、密钥文件和构建产物是否被误加入。
 ## GhostLock 独立页面
