@@ -175,6 +175,13 @@ fun AppsScreen(
     var isSelectionMode by remember { mutableStateOf(false) }
     var selectedApps by remember { mutableStateOf(setOf<String>()) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    val scaffoldModifier = if (embedded) {
+        Modifier.fillMaxSize()
+    } else {
+        Modifier
+            .fillMaxSize()
+            .nestedScroll(scrollBehavior.nestedScrollConnection)
+    }
 
     LaunchedEffect(lifecycleOwner) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -190,9 +197,7 @@ fun AppsScreen(
     }
 
     Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .nestedScroll(scrollBehavior.nestedScrollConnection),
+        modifier = scaffoldModifier,
         topBar = {
             if (isSearching) {
                 TopAppBar(

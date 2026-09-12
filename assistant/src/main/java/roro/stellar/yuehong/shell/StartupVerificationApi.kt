@@ -41,19 +41,6 @@ data class StartupVerification(
     }
 }
 
-data class SupportedModelProfile(
-    val modelName: String,
-    val allKernelVersions: Boolean,
-    val kernelVersions: List<String>,
-    val allSystemVersions: Boolean,
-    val systemVersions: List<String>,
-)
-
-sealed interface SupportedModelsResult {
-    data class Success(val models: List<SupportedModelProfile>) : SupportedModelsResult
-    data class Failure(val reason: String) : SupportedModelsResult
-}
-
 sealed interface StartupVerificationResult {
     data object EndpointNotConfigured : StartupVerificationResult
     data class Success(val verification: StartupVerification) : StartupVerificationResult
@@ -108,62 +95,6 @@ class HttpStartupVerificationApi(context: Context) {
             )
         }.getOrElse { error ->
             StartupVerificationResult.Failure(error.toSafeMessage())
-        }
-    }
-
-    suspend fun loadSupportedModels(): SupportedModelsResult = withContext(Dispatchers.IO) {
-        val endpoint = BuildConfig.SERVER_PROTOCOL_V2_ENDPOINT.trim()
-        if (endpoint.isEmpty()) {
-            return@withContext SupportedModelsResult.Failure("适配机型接口尚未配置")
-        }
-        runCatching {
-            OfficialAppSignature.requireOfficial(appContext)
-            val response = getJson(appendAction(endpoint, "stellar_supported_models"))
-            if (response.code !in 200..299) {
-                throw VerificationException(httpFailureMessage(response.code))
-            }
-            val json = JSONObject(response.body)
-            if (json.optString("status") != "success") {
-                throw VerificationException("服务端未能返回适配机型")
-            }
-            val array = json.optJSONArray("models") ?: throw VerificationException("适配机型数据格式无效")
-            val models = buildList {
-                for (index in 0 until minOf(array.length(), MAX_SUPPORTED_MODELS)) {
-                    val item = array.optJSONObject(index) ?: continue
-                    val modelName = item.optString("modelName").trim().take(MAX_MODEL_NAME_LENGTH)
-                    if (modelName.isEmpty()) continue
-                    val kernelVersionsJson = item.optJSONArray("kernelVersions")
-                    val kernelVersions = buildList {
-                        if (kernelVersionsJson != null) {
-                            for (versionIndex in 0 until minOf(kernelVersionsJson.length(), MAX_KERNEL_VERSIONS)) {
-                                val version = kernelVersionsJson.optString(versionIndex).trim().take(MAX_VERSION_LENGTH)
-                                if (version.isNotEmpty() && version !in this) add(version)
-                            }
-                        }
-                    }
-                    val versionsJson = item.optJSONArray("systemVersions")
-                    val versions = buildList {
-                        if (versionsJson != null) {
-                            for (versionIndex in 0 until minOf(versionsJson.length(), MAX_SYSTEM_VERSIONS)) {
-                                val version = versionsJson.optString(versionIndex).trim().take(MAX_VERSION_LENGTH)
-                                if (version.isNotEmpty() && version !in this) add(version)
-                            }
-                        }
-                    }
-                    add(
-                        SupportedModelProfile(
-                            modelName = modelName,
-                            allKernelVersions = item.optBoolean("allKernelVersions", false),
-                            kernelVersions = kernelVersions,
-                            allSystemVersions = item.optBoolean("allSystemVersions", false),
-                            systemVersions = versions,
-                        ),
-                    )
-                }
-            }
-            SupportedModelsResult.Success(models)
-        }.getOrElse { error ->
-            SupportedModelsResult.Failure(error.toSafeMessage())
         }
     }
 
@@ -363,30 +294,6 @@ class HttpStartupVerificationApi(context: Context) {
         }
     }
 
-    private fun getJson(url: String): HttpResponse {
-        val target = URL(url)
-        if (!target.protocol.equals("https", ignoreCase = true)) {
-            throw VerificationException("适配机型接口必须使用 HTTPS")
-        }
-        val connection = target.openConnection() as HttpURLConnection
-        return try {
-            connection.requestMethod = "GET"
-            connection.instanceFollowRedirects = false
-            connection.connectTimeout = CONNECT_TIMEOUT_MS
-            connection.readTimeout = READ_TIMEOUT_MS
-            connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty(
-                "User-Agent",
-                "YueHongPrivilegeAssistant/${BuildConfig.VERSION_NAME}",
-            )
-            val responseCode = connection.responseCode
-            val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
-            HttpResponse(responseCode, stream?.readUtf8Limited().orEmpty())
-        } finally {
-            connection.disconnect()
-        }
-    }
-
     private fun InputStream.readUtf8Limited(): String = use { input ->
         val output = ByteArrayOutputStream()
         val buffer = ByteArray(8192)
@@ -464,11 +371,6 @@ class HttpStartupVerificationApi(context: Context) {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 15_000
         private const val MAX_RESPONSE_BYTES = 512 * 1024
-        private const val MAX_SUPPORTED_MODELS = 1024
-        private const val MAX_KERNEL_VERSIONS = 128
-        private const val MAX_SYSTEM_VERSIONS = 128
-        private const val MAX_MODEL_NAME_LENGTH = 160
-        private const val MAX_VERSION_LENGTH = 256
         private const val NONCE_BYTES = 24
         private const val CLOCK_SKEW_SECONDS = 30L
         private const val ED25519_PUBLIC_KEY_BYTES = 32

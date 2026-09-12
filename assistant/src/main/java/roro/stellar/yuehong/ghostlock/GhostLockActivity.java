@@ -2,7 +2,6 @@ package roro.stellar.yuehong.ghostlock;
 
 import roro.stellar.yuehong.R;
 import roro.stellar.yuehong.shell.GhostLockOtaApi;
-import roro.stellar.yuehong.ui.DeviceInfoEntry;
 
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
@@ -40,6 +39,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -54,6 +54,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -74,13 +75,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import androidx.activity.ComponentActivity;
-import androidx.compose.ui.platform.ComposeView;
 
 public class GhostLockActivity extends ComponentActivity {
+    private enum OffsetPlatform {
+        MEDIATEK,
+        QUALCOMM,
+        UNKNOWN,
+    }
+
     private static final String TAG = "GhostLockApp";
     private static final String BINARY_NAME = "libghostlock.so";
     private static final String EXTRACT_NAME = "libextract.so";
@@ -92,6 +99,11 @@ public class GhostLockActivity extends ComponentActivity {
     private static final int REQ_PICK_XBL = 1003;
     private static final String PREFS = "ghostlock_prefs";
     private static final String PREF_CPU_PAIR = "cpu_pair";
+    private static final String PREF_BUILTIN_OFFSET_STATUS = "builtin_offset_status";
+    private static final String PREF_DYNAMIC_PAYLOAD_STATUS = "dynamic_payload_status";
+    private static final String STATUS_FAILED_PREFIX = "failed:";
+    private static final String STATUS_SUCCESS_PREFIX = "success:";
+    private static final String DYNAMIC_DIR = "ksuroot";
     private static final int MAX_NATIVE_ATTEMPTS = 2;
     private static final int EXIT_KSU_ACTIVATION_FAILED = 2;
     private static final long NATIVE_RETRY_DELAY_MS = 1500L;
@@ -109,13 +121,14 @@ public class GhostLockActivity extends ComponentActivity {
     private final List<String> cpuPairLabels = new ArrayList<>();
     private final Map<View, ValueAnimator> viewAnimators = new HashMap<>();
     private TextView deviceInfo;
-    private ComposeView deviceInfoButtonHost;
     private TextView logView;
     private ScrollView logScroll;
     private Button copyButton;
-    private Button otaButton;
     private Button autoRootButton;
     private EditText otaUrlInput;
+    private RadioGroup strategyGroup;
+    private File dynamicBaseLibrary;
+    private String dynamicBaselineId = "IONSTACK-P10-CP2A.260605.012";
     private GhostLockOtaApi ghostLockOtaApi;
     private View rootView;
     private int cpuPairIndex;
@@ -148,6 +161,43 @@ public class GhostLockActivity extends ComponentActivity {
         } catch (Throwable ignored) {
             return "";
         }
+    }
+
+    /** Selects the input contract for the offset-table flow only. */
+    private OffsetPlatform detectOffsetPlatform() {
+        String socManufacturer = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                ? Build.SOC_MANUFACTURER : "";
+        String socModel = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                ? Build.SOC_MODEL : "";
+        String probe = (socManufacturer + " " + socModel + " "
+                + getSystemProperty("ro.soc.manufacturer") + " "
+                + getSystemProperty("ro.soc.model") + " "
+                + getSystemProperty("ro.board.platform") + " "
+                + getSystemProperty("ro.hardware") + " "
+                + getSystemProperty("ro.boot.hardware"))
+                .toLowerCase(Locale.ROOT);
+        if (probe.contains("mediatek") || probe.contains("mtk")
+                || probe.contains("dimensity") || probe.contains("helio")) {
+            return OffsetPlatform.MEDIATEK;
+        }
+        if (probe.contains("qualcomm") || probe.contains("qcom")
+                || probe.contains("snapdragon")
+                || probe.matches(".*\\bsm[0-9a-z]+\\b.*")) {
+            return OffsetPlatform.QUALCOMM;
+        }
+        return OffsetPlatform.UNKNOWN;
+    }
+
+    private void runAutomaticOffsetExtract(String input) {
+        OffsetPlatform platform = detectOffsetPlatform();
+        if (platform == OffsetPlatform.MEDIATEK) {
+            appendLog("[偏移表] 联发科平台：提取 boot.img");
+        } else if (platform == OffsetPlatform.QUALCOMM) {
+            appendLog("[偏移表] 骁龙平台：提取 boot.img + xbl_config.img");
+        } else {
+            appendLog("[偏移表] 未识别 SoC，按完整 OTA 提取 boot.img；存在 xbl_config 时一并提取");
+        }
+        runExtract(input, null, true);
     }
 
     private static String readSysFile(String path) {
@@ -291,10 +341,20 @@ public class GhostLockActivity extends ComponentActivity {
         return null;
     }
 
-    /** A kernel can run only after OTA parsing stored a matching offsets.json. */
+    /** True when the current exact uname release is bundled by upstream. */
+    private boolean isBuiltInKernelSupported(String version) {
+        for (String supported : SupportedKernels.UNAMES) {
+            if (supported.equals(version)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A kernel can run with an upstream built-in table or matching OTA offsets. */
     private boolean isKernelSupported() {
         String version = System.getProperty("os.version", "");
-        return importedOffsetsMatch(version);
+        return isBuiltInKernelSupported(version) || importedOffsetsMatch(version);
     }
 
     /**
@@ -396,20 +456,18 @@ public class GhostLockActivity extends ComponentActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                     OnBackInvokedDispatcher.PRIORITY_DEFAULT,
-                    () -> moveTaskToBack(true));
+                    this::finish);
         }
 
         rootView = findViewById(R.id.root);
         deviceInfo = findViewById(R.id.deviceInfo);
-        deviceInfoButtonHost = findViewById(R.id.deviceInfoButtonHost);
         logView = findViewById(R.id.logView);
         logScroll = findViewById(R.id.logScroll);
         copyButton = findViewById(R.id.copyButton);
-        otaButton = findViewById(R.id.otaButton);
         autoRootButton = findViewById(R.id.autoRootButton);
         otaUrlInput = findViewById(R.id.otaUrlInput);
+        strategyGroup = findViewById(R.id.strategyGroup);
         ghostLockOtaApi = new GhostLockOtaApi(this);
-        DeviceInfoEntry.bind(this, deviceInfoButtonHost);
 
         applyWindowInsetsPadding();
         deviceInfo.setText(buildDeviceSummary());
@@ -419,16 +477,240 @@ public class GhostLockActivity extends ComponentActivity {
         setRunState(RunState.IDLE);
 
         copyButton.setOnClickListener(v -> copyLogs());
-        otaButton.setOnClickListener(v -> promptParseUrl());
-        autoRootButton.setOnClickListener(v -> startAutomaticPrivilege());
-        installPressMotion(copyButton, otaButton, autoRootButton);
+        autoRootButton.setOnClickListener(v -> startSelectedPrivilege());
+        installPressMotion(copyButton, autoRootButton);
         playEntryMotion();
     }
 
+    private void startSelectedPrivilege() {
+        if (isDynamicMode()) startAutomaticDynamicPrivilege(); else startAutomaticPrivilege();
+    }
+
+    private boolean isDynamicMode() {
+        return strategyGroup.getCheckedRadioButtonId() == R.id.strategyDynamic;
+    }
+
+    private String preferredDynamicPayloadName() {
+        boolean vivo = Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("vivo")
+                || Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("iqoo")
+                || getSystemProperty("ro.vivo.os.name").length() > 0;
+        return vivo ? "libbs.so" : "libionstack.so";
+    }
+
+    private String dynamicPayloadToken() {
+        return System.getProperty("os.version", "") + "|" + preferredDynamicPayloadName();
+    }
+
+    private boolean isBuiltinOffsetBlocked(String kernelRelease) {
+        String status = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(PREF_BUILTIN_OFFSET_STATUS, "");
+        return (STATUS_FAILED_PREFIX + kernelRelease).equals(status);
+    }
+
+    private void markBuiltinOffsetFailed(String kernelRelease) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_BUILTIN_OFFSET_STATUS, STATUS_FAILED_PREFIX + kernelRelease)
+                .commit();
+    }
+
+    private void markBuiltinOffsetSuccess(String kernelRelease) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_BUILTIN_OFFSET_STATUS, STATUS_SUCCESS_PREFIX + kernelRelease)
+                .commit();
+    }
+
+    private boolean isBuiltinDynamicBlocked(String token) {
+        String status = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(PREF_DYNAMIC_PAYLOAD_STATUS, "");
+        return (STATUS_FAILED_PREFIX + token).equals(status);
+    }
+
+    private void markBuiltinDynamicFailed(String token) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_DYNAMIC_PAYLOAD_STATUS, STATUS_FAILED_PREFIX + token)
+                .commit();
+    }
+
+    private void markBuiltinDynamicSuccess(String token) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_DYNAMIC_PAYLOAD_STATUS, STATUS_SUCCESS_PREFIX + token)
+                .commit();
+    }
+
+    private File selectPreferredDynamicPayload() throws IOException {
+        String library = preferredDynamicPayloadName();
+        boolean vivo = "libbs.so".equals(library);
+        File payload = new File(getApplicationInfo().nativeLibraryDir, library);
+        if (!payload.isFile() || !isElf64(payload)) throw new IOException("missing bundled dynamic payload: " + library);
+        dynamicBaseLibrary = payload;
+        dynamicBaselineId = vivo ? "PD2520-BP2A.250605.031.A3" : "IONSTACK-P10-CP2A.260605.012";
+        appendLog("[KSuRoot] selected bundled payload: " + library);
+        return payload;
+    }
+
+    private int runDynamicPayload(File selected) throws IOException, InterruptedException {
+        if (!isElf64(selected)) throw new IOException("dynamic payload is not ELF64");
+        File dir = new File(getFilesDir(), DYNAMIC_DIR);
+        if (!dir.exists() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
+        File payload = new File(dir, "run-payload.so");
+        copyFile(selected, payload);
+        File helperSource = new File(getApplicationInfo().nativeLibraryDir, "libcve43499root.so");
+        if (!helperSource.isFile()) throw new IOException("missing helper: " + helperSource);
+        // nativeLibraryDir is extracted by the package manager with execute
+        // permission. App-private files/ksuroot may be mounted noexec, so do
+        // not copy the helper there and do not chmod a private-directory copy.
+        File helper = helperSource;
+        appendLog("[KSuRoot] helper: " + helper.getAbsolutePath());
+        File log = new File(dir, "exploit.log");
+        if (log.isFile()) log.delete();
+        ProcessBuilder pb = new ProcessBuilder(helper.getAbsolutePath(), "--run-payload", payload.getAbsolutePath(), helper.getAbsolutePath(), log.getAbsolutePath());
+        pb.directory(dir);
+        pb.redirectErrorStream(true);
+        pb.environment().put("EXPLOIT_ATTEMPTS", "24");
+        pb.environment().put("P0_ATTEMPT_TIMEOUT_SEC", "45");
+        pb.environment().put("EXPLOIT_ATTEMPT_TIMEOUT_SEC", "120");
+        int code = runProcess(pb, 900);
+        if (log.isFile()) appendLog(logText(log));
+        appendLog("[KSuRoot] payload exit code=" + code);
+        return code;
+    }
+
+    private void startAutomaticDynamicPrivilege() {
+        if (running.get() || !automaticFlowRunning.compareAndSet(false, true)) return;
+        setRunState(RunState.RUNNING);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        final String dynamicToken = dynamicPayloadToken();
+        if (isBuiltinDynamicBlocked(dynamicToken)) {
+            appendLog("[KSuRoot] bundled payload was not confirmed successful previously; skipping it and continuing to OTA analysis");
+            requestAutomaticDynamicOta();
+            return;
+        }
+        markBuiltinDynamicFailed(dynamicToken);
+        worker.execute(() -> {
+            int code = 1;
+            try {
+                appendLog("[KSuRoot] detecting bundled payload");
+                code = runDynamicPayload(selectPreferredDynamicPayload());
+            } catch (Throwable e) {
+                appendLog("[KSuRoot] bundled payload failed: " + e.getMessage());
+            }
+            final int finalCode = code;
+            ui.post(() -> {
+                if (finalCode == 0) {
+                    markBuiltinDynamicSuccess(dynamicToken);
+                    automaticFlowRunning.set(false);
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    setRunState(RunState.SUCCESS);
+                } else {
+                    appendLog("[KSuRoot] bundled payload failed; continuing to OTA analysis without trying another payload");
+                    requestAutomaticDynamicOta();
+                }
+            });
+        });
+    }
+
+    private void requestAutomaticDynamicOta() {
+        String explicit = otaUrlInput.getText().toString().trim();
+        if (!explicit.isEmpty()) {
+            if (!isValidOtaUrl(explicit)) {
+                automaticFlowRunning.set(false);
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                setRunState(RunState.FAILED);
+                toast(R.string.ghostlock_parse_failed_url);
+                return;
+            }
+            appendLog("[KSuRoot] using supplied OTA URL");
+            runDynamicOtaFlow(explicit);
+            return;
+        }
+        appendLog("[KSuRoot] requesting current full OTA through protocol v2");
+        ghostLockOtaApi.resolve(result -> {
+            if (!result.getSuccessful()) {
+                automaticFlowRunning.set(false);
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                setRunState(RunState.FAILED);
+                appendLog("[KSuRoot] ROM V2 error: " + result.getErrorMessage());
+                toast(R.string.ghostlock_auto_ota_failed);
+                return;
+            }
+            otaUrlInput.setText(result.getOtaUrl());
+            appendLog("[KSuRoot] ROM V2 provider=" + result.getProvider());
+            runDynamicOtaFlow(result.getOtaUrl());
+        });
+    }
+
+    private void runDynamicOtaFlow(String otaUrl) {
+        worker.execute(() -> {
+            int code = 1;
+            try {
+                File dir = new File(getFilesDir(), DYNAMIC_DIR);
+                if (!dir.exists() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
+                File binary = new File(getApplicationInfo().nativeLibraryDir, EXTRACT_NAME);
+                List<String> args = new ArrayList<>();
+                args.add(otaUrl);
+                args.add("--format"); args.add("json");
+                args.add("--out"); args.add(new File(dir, "ota-offsets.tmp").getAbsolutePath());
+                args.add("--work-dir"); args.add(dir.getAbsolutePath());
+                appendLog("[KSuRoot] extracting boot from OTA");
+                code = runExtractProcess(binary, args, dir);
+                if (code != 0) throw new IOException("OTA extraction exit code=" + code);
+                File boot = latestExtractedBoot(dir);
+                if (boot == null) throw new IOException("extracted boot.img was not found");
+                appendLog("[KSuRoot] building payload from " + boot.getAbsolutePath());
+                File base = dynamicBaseLibrary;
+                if (base == null || !base.isFile()) base = selectPreferredDynamicPayload();
+                DynamicBuildResult result = DynamicPayloadEngine.build(java.nio.file.Files.readAllBytes(boot.toPath()), java.nio.file.Files.readAllBytes(base.toPath()), dynamicBaselineId, line -> appendLog("[KSuRoot] " + line));
+                if (result.getPayload() == null) throw new IOException("payload build returned no output");
+                File built = new File(dir, "payload-patched.so");
+                try (FileOutputStream output = new FileOutputStream(built, false)) { output.write(result.getPayload()); }
+                appendLog(result.getSummary());
+                if (!result.getWarnings().isEmpty()) appendLog("[KSuRoot] warning: " + result.getWarnings());
+                code = runDynamicPayload(built);
+            } catch (Throwable e) {
+                appendLog("[KSuRoot] OTA fallback failed: " + e.getMessage());
+            }
+            final int finalCode = code;
+            ui.post(() -> {
+                automaticFlowRunning.set(false);
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                setRunState(finalCode == 0 ? RunState.SUCCESS : RunState.FAILED);
+            });
+        });
+    }
+
+    private File latestExtractedBoot(File dir) {
+        File[] entries = dir.listFiles();
+        if (entries == null) return null;
+        File selected = null;
+        for (File entry : entries) {
+            if (!entry.isDirectory() || !entry.getName().startsWith("ghostlock-payload-")) continue;
+            File[] boots = entry.listFiles((parent, name) -> name.equals("boot") || name.equals("boot.img"));
+            if (boots != null && boots.length > 0 && (selected == null || boots[0].lastModified() > selected.lastModified())) selected = boots[0];
+        }
+        return selected;
+    }
+
+    private boolean isValidOtaUrl(String value) { return value.startsWith("https://") || value.startsWith("http://"); }
+
+    private boolean isElf64(File file) {
+        try (InputStream in = new FileInputStream(file)) {
+            byte[] h = new byte[5];
+            return in.read(h) == h.length && h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F' && h[4] == 2;
+        } catch (IOException e) { return false; }
+    }
+
+    private void copyFile(File source, File target) throws IOException {
+        if (source == null || !source.isFile()) throw new IOException("file missing: " + source);
+        try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(target, false)) { copyStream(in, out); }
+    }
+
+    private String logText(File file) {
+        try { return new String(java.nio.file.Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8); }
+        catch (IOException e) { return ""; }
+    }
     @Override
     public void onBackPressed() {
-        // 返回键仅将任务移到后台，保留正在运行的工作线程和服务。
-        moveTaskToBack(true);
+        finish();
     }
 
     @Override
@@ -748,6 +1030,41 @@ public class GhostLockActivity extends ComponentActivity {
             return;
         }
         setRunState(RunState.RUNNING);
+        String suppliedOta = otaUrlInput.getText().toString().trim();
+        if (!suppliedOta.isEmpty()) {
+            if (!isValidOtaUrl(suppliedOta)) {
+                automaticFlowRunning.set(false);
+                setRunState(RunState.FAILED);
+                toast(R.string.ghostlock_parse_failed_url);
+                return;
+            }
+            appendLog("using supplied OTA URL");
+            runAutomaticOffsetExtract(suppliedOta);
+            return;
+        }
+        String kernelRelease = System.getProperty("os.version", "");
+        if (importedOffsetsMatch(kernelRelease)) {
+            appendLog("cached offsets.json matches current kernel; reusing it before APK built-in offsets");
+            automaticFlowRunning.set(false);
+            startExploit();
+            return;
+        }
+        if (isBuiltInKernelSupported(kernelRelease)) {
+            if (isBuiltinOffsetBlocked(kernelRelease)) {
+                appendLog("APK built-in offsets were not confirmed successful previously; skipping them and continuing to OTA parsing");
+                requestAutomaticOta();
+                return;
+            }
+            markBuiltinOffsetFailed(kernelRelease);
+            appendLog("APK built-in support matched; starting without OTA parsing");
+            automaticFlowRunning.set(false);
+            startExploit(true);
+            return;
+        }
+        requestAutomaticOta();
+    }
+
+    private void requestAutomaticOta() {
         autoRootButton.setText(R.string.ghostlock_action_resolving_ota);
         appendLog("requesting current full OTA through protocol v2");
         ghostLockOtaApi.resolve(result -> {
@@ -762,7 +1079,7 @@ public class GhostLockActivity extends ComponentActivity {
             otaUrlInput.setText(url);
             appendLog("ROM V2 provider=" + result.getProvider());
             appendLog("ROM V2 OTA: " + url);
-            runExtract(url, null, true);
+            runAutomaticOffsetExtract(url);
         });
     }
 
@@ -964,6 +1281,9 @@ public class GhostLockActivity extends ComponentActivity {
                     args.add("--xbl-config");
                     args.add(xblFile.getAbsolutePath());
                 }
+                if (automaticFlow && detectOffsetPlatform() == OffsetPlatform.QUALCOMM) {
+                    args.add("--require-xbl");
+                }
                 args.add("--format");
                 args.add("json");
                 args.add("--out");
@@ -1045,6 +1365,7 @@ public class GhostLockActivity extends ComponentActivity {
         return switch (code) {
             case 3, 4 -> R.string.ghostlock_parse_failed_route;
             case 5 -> R.string.ghostlock_parse_failed_kallsyms;
+            case 6 -> R.string.ghostlock_parse_failed_fixed;
             case -1 -> R.string.ghostlock_parse_timeout;
             default -> R.string.ghostlock_parse_failed;
         };
@@ -1097,8 +1418,12 @@ public class GhostLockActivity extends ComponentActivity {
     }
 
     private void startExploit() {
+        startExploit(false);
+    }
+
+    private void startExploit(boolean otaFallbackAfterBuiltInFailure) {
         if (!isKernelSupported()) {
-            appendLog("no OTA-parsed offsets match the current kernel");
+            appendLog("no upstream built-in or OTA-parsed offsets match the current kernel");
             toast(R.string.ghostlock_parse_failed);
             return;
         }
@@ -1125,7 +1450,16 @@ public class GhostLockActivity extends ComponentActivity {
                     running.set(false);
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     if (finalCode == 0) {
+                        if (otaFallbackAfterBuiltInFailure) {
+                            markBuiltinOffsetSuccess(System.getProperty("os.version", ""));
+                        }
                         setRunState(RunState.SUCCESS);
+                    } else if (otaFallbackAfterBuiltInFailure
+                            && automaticFlowRunning.compareAndSet(false, true)) {
+                        appendLog("APK built-in offsets failed with exit code=" + finalCode
+                                + "; falling back to OTA parsing");
+                        setRunState(RunState.RUNNING);
+                        requestAutomaticOta();
                     } else {
                         setRunState(RunState.FAILED);
                     }
@@ -1136,9 +1470,7 @@ public class GhostLockActivity extends ComponentActivity {
 
     private void setRunState(RunState state) {
         boolean busy = state == RunState.RUNNING || automaticFlowRunning.get();
-        otaButton.setEnabled(!busy);
         autoRootButton.setEnabled(!busy);
-        otaButton.setText(state == RunState.RUNNING ? R.string.ghostlock_action_running : R.string.ghostlock_action_parse_ota);
         autoRootButton.setText(busy ? R.string.ghostlock_action_running : R.string.ghostlock_action_start_privilege);
     }
 
@@ -1172,7 +1504,6 @@ public class GhostLockActivity extends ComponentActivity {
         pb.environment().put("GHOSTLOCK_HOME", workDir.getAbsolutePath());
         pb.environment().put("TMPDIR", workDir.getAbsolutePath());
         pb.environment().put("HOME", workDir.getAbsolutePath());
-        pb.environment().put("YHROOT_TMP_ROOT", workDir.getAbsolutePath());
         pb.environment().put("YHROOT_CLEANUP_DELAY", "5");
         int[] pair = cpuPairs.get(cpuPairIndex);
         if (pair[0] != 0 || pair[1] != 1) {

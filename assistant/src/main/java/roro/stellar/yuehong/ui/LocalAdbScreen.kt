@@ -276,7 +276,6 @@ private fun LocalAdbHeader(
                     )
                 }
             }
-            SharedDeviceInfoButton(compact = compact)
         }
     }
 }
@@ -424,7 +423,7 @@ private fun EscalationCard(
 }
 
 @Composable
-private fun LocalPayloadCommandDialog(
+fun LocalPayloadCommandDialog(
     command: String,
     onCommandChange: (String) -> Unit,
     onConfirm: () -> Unit,

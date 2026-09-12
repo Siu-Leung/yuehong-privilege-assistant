@@ -2,7 +2,7 @@ package roro.stellar.yuehong.ui
 
 import android.app.Activity
 import android.content.Intent
-import android.os.Build
+import android.system.Os
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -32,6 +32,7 @@ import roro.stellar.yuehong.shell.StartupVerificationResult
 private enum class AppPage {
     Announcement,
     ChannelVerification,
+    ModeSelection,
 }
 
 @Composable
@@ -44,23 +45,39 @@ fun StellarAssistantApp() {
         }
         var page by rememberSaveable { mutableStateOf(AppPage.Announcement) }
         var startupRefreshGeneration by rememberSaveable { mutableIntStateOf(0) }
+        val kernelRelease = remember {
+            runCatching { Os.uname().release }.getOrNull().orEmpty().ifBlank {
+                System.getProperty("os.version", "unknown")
+            }
+        }
+        val ghostLockKernelAvailable = remember(kernelRelease) {
+            GHOSTLOCK_KERNEL_PATTERN.containsMatchIn(kernelRelease)
+        }
 
-        fun openKernelMode() {
-            val release = System.getProperty("os.version").orEmpty()
+        fun openGhostLockMode() {
             val activity = context as? Activity ?: return
-            val intent = if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM &&
-                isGhostLockKernel(release)
-            ) {
-                Intent(context, GhostLockActivity::class.java)
-            } else {
-                Intent().apply {
-                    setClassName(
-                        context.packageName,
-                        "roro.stellar.manager.ui.features.manager.ManagerActivity",
-                    )
-                    putExtra("route", "workspace")
-                }
+            activity.startActivity(Intent(context, GhostLockActivity::class.java))
+        }
+
+        fun openStellarMode() {
+            val activity = context as? Activity ?: return
+            val intent = Intent().apply {
+                setClassName(
+                    context.packageName,
+                    "roro.stellar.manager.ui.features.manager.ManagerActivity",
+                )
+                putExtra("route", "workspace")
+            }
+            activity.startActivity(intent)
+        }
+
+        fun openVivoWiredMode() {
+            val activity = context as? Activity ?: return
+            val intent = Intent().apply {
+                setClassName(
+                    context.packageName,
+                    "roro.stellar.manager.ui.features.wired.VivoWiredActivity",
+                )
             }
             activity.startActivity(intent)
         }
@@ -87,7 +104,7 @@ fun StellarAssistantApp() {
                     api = startupVerificationApi,
                     refreshGeneration = startupRefreshGeneration,
                     onContinue = { verification ->
-                        if (verification.authorized) openKernelMode()
+                        if (verification.authorized) page = AppPage.ModeSelection
                         else page = AppPage.ChannelVerification
                     },
                     onRetry = { startupRefreshGeneration++ },
@@ -96,20 +113,26 @@ fun StellarAssistantApp() {
 
                 AppPage.ChannelVerification -> ChannelVerificationScreen(
                     api = startupVerificationApi,
-                    onVerified = ::openKernelMode,
+                    onVerified = { page = AppPage.ModeSelection },
                     onStartupInvalidated = {
                         startupRefreshGeneration++
                         page = AppPage.Announcement
                     },
                     onExit = { (context as? Activity)?.moveTaskToBack(true) },
                 )
+
+                AppPage.ModeSelection -> ModeSelectionScreen(
+                    ghostLockKernelAvailable = ghostLockKernelAvailable,
+                    onOpenGhostLock = ::openGhostLockMode,
+                    onOpenStellar = ::openStellarMode,
+                    onOpenVivoWired = ::openVivoWiredMode,
+                )
             }
         }
     }
 }
 
-private fun isGhostLockKernel(release: String): Boolean =
-    release.startsWith("6.6.") || release.startsWith("6.12.")
+private val GHOSTLOCK_KERNEL_PATTERN = Regex("^6\\.")
 
 @Composable
 private fun AnnouncementGate(
@@ -142,10 +165,9 @@ private fun AnnouncementGate(
                 result = loadedResult,
                 localVersion = BuildConfig.VERSION_NAME,
                 localVersionCode = BuildConfig.VERSION_CODE,
-                onContinue = onContinue,
-                onLoadSupportedModels = api::loadSupportedModels,
-                onRetry = onRetry,
-                onExit = onExit,
+                    onContinue = onContinue,
+                    onRetry = onRetry,
+                    onExit = onExit,
             )
         }
     }

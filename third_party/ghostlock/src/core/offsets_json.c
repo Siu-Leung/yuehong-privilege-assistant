@@ -212,8 +212,9 @@ static const struct {
   {"task_seccomp", offsetof(struct kernel_offsets, task_seccomp)},
 };
 
-/* Fill `out` from one OTA-parsed JSON object [obj, end).  The OTA-only caller
- * zeroes `out` before every load; no compiled per-kernel table is involved. */
+/* Fill `out` from one JSON object [obj, end).  Fields absent from the JSON
+ * keep whatever the caller put into `out` (zeroed for a fresh table, or a
+ * built-in entry the JSON is overriding). */
 static void fill_external_entry(struct kernel_offsets *out,
                                 const char *release_buf, const char *obj,
                                 const char *end) {
@@ -227,6 +228,14 @@ static void fill_external_entry(struct kernel_offsets *out,
   v = json_member_value(obj, end, "pselect_waiter_shift");
   if (v && json_parse_int(v, end, &num)) {
     out->pselect_waiter_shift = (int)num;
+  }
+  v = json_member_value(obj, end, "compact_waiter");
+  if (v && json_parse_int(v, end, &num)) {
+    out->compact_waiter = (uint8_t)num;
+  }
+  v = json_member_value(obj, end, "mm_struct_sz");
+  if (v && json_parse_int(v, end, &num)) {
+    out->mm_struct_sz = (uint32_t)num;
   }
   v = json_member_value(obj, end, "symbols");
   if (v && *v == '{') {
@@ -252,6 +261,12 @@ static void fill_external_entry(struct kernel_offsets *out,
         }
       }
     }
+  }
+  /* a zeroed entry selects the 6.6 waiter layout; warn rather than fail quietly */
+  if (strncmp(out->uname_r, "6.1.", 4) == 0 && !out->compact_waiter) {
+    fprintf(stderr,
+            "warning: imported 6.1 entry has no compact_waiter; it will run "
+            "the 6.6 rb_node waiter layout and miss\n");
   }
 }
 

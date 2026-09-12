@@ -16,8 +16,8 @@ android {
     defaultConfig {
         applicationId "roro.stellar.yuehong"
         minSdk 28
-        versionCode 120
-        versionName "v1.2"
+        versionCode rootProject.ext.yuehongVersionCode
+        versionName rootProject.ext.yuehongVersionName
 
         // 月虹提权助手与 GhostLock 运行目标均为 64 位 ARM 真机；去除模拟器/32 位重复库。
         ndk {
@@ -93,6 +93,7 @@ android {
         }
         jniLibs {
             useLegacyPackaging = true
+            keepDebugSymbols += ["**/libbs.so", "**/libionstack.so", "**/libcve43499root.so"]
         }
     }
 

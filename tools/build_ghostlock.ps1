@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $buildRoot = $projectRoot
 $junctionPath = $null
+$originalCargoTargetDir = $env:CARGO_TARGET_DIR
 
 if ($projectRoot -match '[^\x00-\x7F]') {
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
@@ -44,10 +45,9 @@ try {
     $responseFile = Join-Path $vendorRoot '.ghostlock-clang.rsp'
     $clangArgs = @(
         '-O2', '-flto', '-Wall', '-Wno-unused-parameter', '-Wno-sign-compare', '-Wno-unused-function',
-        '-Isrc/core', '-Isrc/kernels', '-DTARGET_CONFIG_H=target.h',
+        '-Isrc/core', '-Isrc/kernels', '-DTARGET_CONFIG_H=\"target.h\"',
         '-fPIE', '-pie', '-pthread', '-flto',
         'src/core/main.c', 'src/core/offsets_json.c', 'src/core/util.c', 'src/core/fops.c',
-        'src/core/mcast_route.c',
         '-o', 'ghostlock'
     )
     [IO.File]::WriteAllLines($responseFile, $clangArgs, (New-Object Text.UTF8Encoding($false)))
@@ -60,6 +60,12 @@ try {
     }
 
     $extractRoot = Join-Path $vendorRoot 'tools\extract_rs'
+    if ($junctionPath) {
+        $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath(
+            (Join-Path ([IO.Path]::GetTempPath()) 'yhroot-ghostlock-cargo-target')
+        )
+        New-Item -ItemType Directory -Path $env:CARGO_TARGET_DIR -Force | Out-Null
+    }
     $env:CC_aarch64_linux_android = $clang
     $env:AR_aarch64_linux_android = Join-Path $binRoot ($(if ($prebuilt -eq 'windows-x86_64') { 'llvm-ar.exe' } else { 'llvm-ar' }))
     $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $clang
@@ -73,7 +79,8 @@ try {
 
     New-Item -ItemType Directory -Path $jniRoot -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $vendorRoot 'ghostlock') -Destination (Join-Path $jniRoot 'libghostlock.so') -Force
-    Copy-Item -LiteralPath (Join-Path $extractRoot 'target\aarch64-linux-android\release\ghostlock-extract') -Destination (Join-Path $jniRoot 'libextract.so') -Force
+    $cargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $extractRoot 'target' }
+    Copy-Item -LiteralPath (Join-Path $cargoTargetRoot 'aarch64-linux-android\release\ghostlock-extract') -Destination (Join-Path $jniRoot 'libextract.so') -Force
 
     foreach ($name in @('libghostlock.so', 'libextract.so')) {
         $file = Get-Item -LiteralPath (Join-Path $jniRoot $name)
@@ -81,6 +88,7 @@ try {
         Write-Output "GHOSTLOCK_ARTIFACT=$name SIZE=$($file.Length) SHA256=$sha"
     }
 } finally {
+    $env:CARGO_TARGET_DIR = $originalCargoTargetDir
     if ($junctionPath -and (Test-Path -LiteralPath $junctionPath)) {
         $junction = Get-Item -LiteralPath $junctionPath -Force
         if (-not ($junction.Attributes -band [IO.FileAttributes]::ReparsePoint)) {

@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -26,24 +25,19 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,13 +47,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import roro.stellar.yuehong.BuildConfig
 import roro.stellar.yuehong.R
+import roro.stellar.yuehong.BuildConfig
 import roro.stellar.yuehong.shell.StartupVerification
 import roro.stellar.yuehong.shell.StartupVerificationResult
-import roro.stellar.yuehong.shell.SupportedModelProfile
-import roro.stellar.yuehong.shell.SupportedModelsResult
-import kotlinx.coroutines.launch
 
 // 首次启动公告页面：加载并确认后才允许进入本地 ADB 页面。
 // 公告、版本号与频道授权状态均来自服务端签名的启动响应。
@@ -70,7 +61,6 @@ fun AnnouncementScreen(
     localVersion: String,
     localVersionCode: Int,
     onContinue: (StartupVerification) -> Unit,
-    onLoadSupportedModels: suspend () -> SupportedModelsResult,
     onRetry: () -> Unit,
     onExit: () -> Unit,
 ) {
@@ -120,18 +110,6 @@ fun AnnouncementScreen(
     val context = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val accent = if (needUpdate || verificationFailed) colors.error else colors.primary
-    var showSupportedModels by remember { mutableStateOf(false) }
-    var supportedModelsResult by remember { mutableStateOf<SupportedModelsResult?>(null) }
-    var supportedModelsLoading by remember { mutableStateOf(false) }
-    val coroutineScope = rememberCoroutineScope()
-    val requestSupportedModels: () -> Unit = {
-        supportedModelsLoading = true
-        supportedModelsResult = null
-        coroutineScope.launch {
-            supportedModelsResult = onLoadSupportedModels()
-            supportedModelsLoading = false
-        }
-    }
 
     Box(
         modifier = Modifier
@@ -145,7 +123,7 @@ fun AnnouncementScreen(
                 .padding(horizontal = 20.dp, vertical = 18.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            BrandHeader(accent = accent)
+            BrandHeader()
             Spacer(Modifier.height(14.dp))
 
             Card(
@@ -293,22 +271,6 @@ fun AnnouncementScreen(
 
             Spacer(Modifier.height(14.dp))
 
-            OutlinedButton(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                enabled = !supportedModelsLoading,
-                shape = RoundedCornerShape(16.dp),
-                onClick = {
-                    showSupportedModels = true
-                    requestSupportedModels()
-                },
-            ) {
-                Text(stringResource(R.string.supported_models_button), fontWeight = FontWeight.SemiBold)
-            }
-
-            Spacer(Modifier.height(10.dp))
-
             if (needUpdate) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -387,139 +349,6 @@ fun AnnouncementScreen(
         }
     }
 
-    if (showSupportedModels) {
-        SupportedModelsDialog(
-            result = supportedModelsResult,
-            loading = supportedModelsLoading,
-            onRetry = requestSupportedModels,
-            onDismiss = { showSupportedModels = false },
-        )
-    }
-}
-
-@Composable
-private fun SupportedModelsDialog(
-    result: SupportedModelsResult?,
-    loading: Boolean,
-    onRetry: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val colors = MaterialTheme.colorScheme
-    var searchQuery by remember(result) { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.supported_models_title)) },
-        text = {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 96.dp, max = 420.dp),
-                contentAlignment = if (loading) Alignment.Center else Alignment.TopStart,
-            ) {
-                when {
-                    loading -> CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.5.dp)
-                    result is SupportedModelsResult.Failure -> Text(
-                        text = result.reason,
-                        color = colors.error,
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    result is SupportedModelsResult.Success && result.models.isEmpty() -> Text(
-                        text = stringResource(R.string.supported_models_empty),
-                        color = colors.onSurfaceVariant,
-                    )
-                    result is SupportedModelsResult.Success -> {
-                        val allKernelVersionsText = stringResource(R.string.supported_models_all_kernels)
-                        val allVersionsText = stringResource(R.string.supported_models_all_versions)
-                        val pendingTestText = stringResource(R.string.supported_models_pending_test)
-                        fun kernelVersionsText(model: SupportedModelProfile): String = when {
-                            model.allKernelVersions -> allKernelVersionsText
-                            model.kernelVersions.isNotEmpty() -> model.kernelVersions.joinToString("、")
-                            else -> pendingTestText
-                        }
-                        fun systemVersionsText(model: SupportedModelProfile): String = when {
-                            model.allSystemVersions -> allVersionsText
-                            model.systemVersions.isNotEmpty() -> model.systemVersions.joinToString("、")
-                            else -> pendingTestText
-                        }
-                        val query = searchQuery.trim()
-                        val filteredModels = if (query.isEmpty()) {
-                            result.models
-                        } else {
-                            result.models.filter { model ->
-                                model.modelName.contains(query, ignoreCase = true) ||
-                                    kernelVersionsText(model).contains(query, ignoreCase = true) ||
-                                    systemVersionsText(model).contains(query, ignoreCase = true)
-                            }
-                        }
-
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            OutlinedTextField(
-                                value = searchQuery,
-                                onValueChange = { searchQuery = it },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true,
-                                label = { Text(stringResource(R.string.supported_models_search_label)) },
-                                placeholder = { Text(stringResource(R.string.supported_models_search_hint)) },
-                            )
-                            if (filteredModels.isEmpty()) {
-                                Text(
-                                    text = stringResource(R.string.supported_models_search_empty),
-                                    color = colors.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            } else {
-                                Column(
-                                    modifier = Modifier
-                                        .weight(1f, fill = false)
-                                        .verticalScroll(rememberScrollState()),
-                                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                                ) {
-                                    filteredModels.forEachIndexed { index, model ->
-                                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                            Text(
-                                                text = model.modelName,
-                                                fontWeight = FontWeight.Bold,
-                                                color = colors.onSurface,
-                                            )
-                                            Text(
-                                                text = stringResource(
-                                                    R.string.supported_models_kernel_versions,
-                                                    kernelVersionsText(model),
-                                                ),
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = colors.onSurfaceVariant,
-                                            )
-                                            Text(
-                                                text = stringResource(
-                                                    R.string.supported_models_system_versions,
-                                                    systemVersionsText(model),
-                                                ),
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = colors.onSurfaceVariant,
-                                            )
-                                        }
-                                        if (index < filteredModels.lastIndex) HorizontalDivider()
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else -> Unit
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text(stringResource(R.string.supported_models_close)) }
-        },
-        dismissButton = {
-            if (!loading && result is SupportedModelsResult.Failure) {
-                TextButton(onClick = onRetry) { Text(stringResource(R.string.supported_models_retry)) }
-            }
-        },
-    )
 }
 
 @Composable
@@ -537,7 +366,7 @@ fun AnnouncementLoadingScreen() {
                 .padding(horizontal = 20.dp, vertical = 18.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            BrandHeader(accent = colors.primary)
+            BrandHeader()
             Spacer(Modifier.height(14.dp))
 
             Card(
@@ -575,11 +404,6 @@ fun AnnouncementLoadingScreen() {
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold,
                             color = colors.onSurface,
-                        )
-                        Text(
-                            text = stringResource(R.string.announcement_loading_subtitle),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = colors.onSurfaceVariant,
                         )
                     }
 
@@ -628,12 +452,6 @@ fun AnnouncementLoadingScreen() {
                                 fontWeight = FontWeight.SemiBold,
                                 textAlign = TextAlign.Center,
                             )
-                            Text(
-                                text = stringResource(R.string.announcement_security_hint),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = colors.onSurfaceVariant,
-                                textAlign = TextAlign.Center,
-                            )
                         }
                     }
                 }
@@ -656,24 +474,21 @@ fun AnnouncementLoadingScreen() {
 }
 
 @Composable
-private fun BrandHeader(accent: Color) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+private fun BrandHeader() {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        Spacer(Modifier.size(40.dp))
         Text(
+            modifier = Modifier.weight(1f),
             text = stringResource(R.string.app_name),
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface,
             textAlign = TextAlign.Center,
         )
-        Text(
-            text = stringResource(R.string.announcement_ready_hint),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
+        SharedDeviceInfoButton(compact = true)
     }
 }
 
@@ -716,6 +531,6 @@ private fun InfoTile(
     }
 }
 
-// 公告版本不一致时，“立即更新”使用公开构建者自行配置的主页。
+// 公告版本不一致时，“立即更新”跳转到项目更新主页
 private val UPDATE_URL: String
     get() = BuildConfig.SERVER_UPDATE_URL.trim()

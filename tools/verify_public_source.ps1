@@ -1,9 +1,12 @@
 [CmdletBinding()]
 param(
-    [string]$Root = (Split-Path -Parent $PSScriptRoot)
+    [string]$Root
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Root)) {
+    $Root = Join-Path -Path $PSScriptRoot -ChildPath '..'
+}
 $Root = (Resolve-Path -LiteralPath $Root).Path
 
 $forbiddenNames = @(
@@ -39,6 +42,10 @@ $privateMaterialHits = $textFiles | Select-String -Pattern @(
     '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----',
     '^\s*(storePassword|keyPassword)\s*=\s*\S+'
 )
+$privateIdentifierHits = $textFiles | Select-String -Pattern @(
+    'yhyun\.asia',
+    'moduleId\s*=\s*yhtq'
+)
 
 $requiredLicenseFiles = @(
     'LICENSE',
@@ -58,6 +65,7 @@ Write-Output "FORBIDDEN_DIRECTORIES=$($badDirectories.Count)"
 Write-Output "NONEMPTY_EXAMPLE_VALUES=$($nonEmptyExampleValues.Count)"
 Write-Output "HARDCODED_UPDATE_URL=$hardcodedUpdateUrl"
 Write-Output "PRIVATE_MATERIAL_HITS=$($privateMaterialHits.Count)"
+Write-Output "PRIVATE_IDENTIFIER_HITS=$($privateIdentifierHits.Count)"
 Write-Output "MISSING_LICENSE_FILES=$($missingLicenses.Count)"
 
 if ($badFiles.Count -gt 0 -or
@@ -65,6 +73,7 @@ if ($badFiles.Count -gt 0 -or
     $nonEmptyExampleValues.Count -gt 0 -or
     $hardcodedUpdateUrl -or
     $privateMaterialHits.Count -gt 0 -or
+    $privateIdentifierHits.Count -gt 0 -or
     $missingLicenses.Count -gt 0) {
     Write-Output 'PUBLIC_SOURCE_RESULT=FAIL'
     exit 1

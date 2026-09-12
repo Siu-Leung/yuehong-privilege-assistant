@@ -1,0 +1,668 @@
+package roro.stellar.manager.ui.features.wired
+
+import android.content.Context
+import android.net.Uri
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import org.json.JSONObject
+import roro.stellar.manager.adb.UsbAdbClient
+import roro.stellar.yuehong.shell.CompatibilityResult
+import roro.stellar.yuehong.shell.DeviceProfile
+import roro.stellar.yuehong.shell.HttpCompatibilityApi
+import roro.stellar.yuehong.shell.HttpPayloadResourceDownloader
+import roro.stellar.yuehong.shell.PayloadResource
+import roro.stellar.yuehong.shell.ResourceTicketResult
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+
+internal enum class VivoWiredStage {
+    Idle,
+    Connecting,
+    CollectingDeviceInfo,
+    RequestingPayload,
+    DownloadingPayload,
+    TransferringPayload,
+    Rebooting,
+    Reconnecting,
+    WaitingForBoot,
+    ExecutingPayload,
+    CheckingRoot,
+    ActivatingKernelSu,
+    Done,
+    Failed,
+}
+
+internal data class VivoWiredProgress(
+    val stage: VivoWiredStage = VivoWiredStage.Idle,
+    val running: Boolean = false,
+    val status: String = "等待连接 vivo/iQOO 目标设备",
+    val target: String = "尚未读取目标设备",
+    val transferProgress: Int? = null,
+    val logs: List<String> = emptyList(),
+    val success: Boolean = false,
+)
+
+internal data class VivoWiredLocalRequest(
+    val uri: Uri,
+    val command: String,
+)
+
+/** USB-host ADB privilege flow; online payloads remain vivo/iQOO-specific, local payloads are unrestricted. */
+internal class VivoWiredEscalator(
+    context: Context,
+    private val connectTarget: suspend (waitingAfterReboot: Boolean) -> UsbAdbClient,
+    private val publish: (VivoWiredProgress) -> Unit,
+) : AutoCloseable {
+    private val appContext = context.applicationContext
+    private val compatibilityApi = HttpCompatibilityApi(appContext)
+    private val downloader = HttpPayloadResourceDownloader(appContext)
+    private var state = VivoWiredProgress()
+
+    suspend fun run(localRequest: VivoWiredLocalRequest? = null) {
+        var client: UsbAdbClient? = null
+        var payloadFile: File? = null
+        try {
+            update(VivoWiredStage.Connecting, "正在连接目标设备")
+            client = connectTarget(false)
+
+            update(VivoWiredStage.CollectingDeviceInfo, "正在读取目标设备信息")
+            val profile = collectTargetProfile(client)
+            if (localRequest == null) {
+                requireVivo(profile)
+            } else {
+                log("本地提权文件模式跳过 vivo/iQOO 品牌检查")
+            }
+            setTarget(profile)
+            log("已确认目标设备：${profile.brandName} ${profile.modelName}")
+            log("型号=${profile.modelName}")
+            log("系统=${profile.systemVersion}")
+            log("内核=${profile.kernelVersion}")
+
+            val payloadCommand: String
+            val suPath: String
+            if (localRequest == null) {
+                update(VivoWiredStage.RequestingPayload, "正在请求设备专属提权文件")
+                val payload = requestPayload(profile)
+                validateCommand(payload.command)
+                validateSuPath(payload.suPath)
+                log("服务端已返回严格匹配的设备专属文件")
+
+                update(VivoWiredStage.DownloadingPayload, "正在下载并校验提权文件")
+                payloadFile = downloadPayload(payload)
+                payloadCommand = payload.command
+                suPath = payload.suPath
+                log("提权文件 SHA-256 与大小校验通过")
+            } else {
+                validateCommand(localRequest.command, local = true)
+                update(VivoWiredStage.DownloadingPayload, "正在读取本地提权文件")
+                payloadFile = copyLocalPayload(localRequest.uri)
+                payloadCommand = localRequest.command
+                suPath = LOCAL_PAYLOAD_SU_PATH
+                log("已读取本地提权文件，不请求服务器")
+            }
+
+            update(VivoWiredStage.TransferringPayload, "正在传输提权文件")
+            client.shell("rm -f -- '$REMOTE_PAYLOAD'")
+            client = pushFileWithRetry(client, payloadFile, REMOTE_PAYLOAD)
+            val installCheck = client.shell("chmod 0755 '$REMOTE_PAYLOAD' && test -f '$REMOTE_PAYLOAD' && test -x '$REMOTE_PAYLOAD'")
+            if (installCheck.exitCode != 0) throw IOException("目标设备提权文件安装失败：${installCheck.output}")
+            log("提权文件已写入目标设备：$REMOTE_PAYLOAD")
+
+            update(VivoWiredStage.Rebooting, "正在重启目标设备")
+            log("发送目标设备重启命令")
+            try {
+                client.reboot()
+            } catch (error: IOException) {
+                // A successful reboot commonly disconnects USB before adbd can return a close frame.
+                log("目标设备已进入重启阶段：${error.message.orEmpty()}")
+            }
+            client.close()
+            client = null
+
+            update(VivoWiredStage.Reconnecting, "等待目标设备重新连接")
+            delay(REBOOT_DISCONNECT_GRACE_MS)
+            client = connectTarget(true)
+            log("目标设备 ADB 已重新连接")
+
+            update(VivoWiredStage.WaitingForBoot, "等待目标设备完成启动")
+            client = waitForBootCompleted(client)
+            log("目标设备系统启动完成")
+            update(VivoWiredStage.WaitingForBoot, "目标设备已启动，等待 5 秒")
+            log("目标设备完全开机，等待 5 秒后执行提权命令")
+            delay(POST_BOOT_COMMAND_DELAY_MS)
+
+            val commandSource = if (localRequest == null) "设备专属" else "本地"
+            update(VivoWiredStage.ExecutingPayload, "正在执行${commandSource}提权命令")
+            log("开始执行${commandSource}提权命令：$payloadCommand")
+            val execution = client.shell(payloadCommand)
+            log("${commandSource}提权命令输出：${execution.output.trim().ifBlank { "<空>" }}")
+            log("${commandSource}提权命令退出码=${execution.exitCode}")
+            if (execution.exitCode != 0) {
+                if (localRequest == null) {
+                    throw IOException("设备专属提权命令退出码=${execution.exitCode}")
+                }
+                log("本地提权命令退出码=${execution.exitCode}，继续检查临时 root")
+            }
+
+            log("${commandSource}提权命令执行结束，开始检查临时 root")
+            update(VivoWiredStage.CheckingRoot, "正在确认临时 root")
+            val rootCheck = client.shell("$suPath -c id")
+            if (!ROOT_UID_PATTERN.containsMatchIn(rootCheck.output)) {
+                throw IOException("临时 root 检查未返回 uid=0：${rootCheck.output}")
+            }
+            log("目标设备临时 root 已确认")
+
+            update(VivoWiredStage.ActivatingKernelSu, "正在传输 KernelSU 激活脚本")
+            val activationScript = copyActivationScript()
+            try {
+                client = pushFileWithRetry(
+                    initialClient = client,
+                    source = activationScript,
+                    destination = REMOTE_ACTIVATION_SCRIPT,
+                    mode = ACTIVATION_SCRIPT_MODE,
+                )
+            } finally {
+                activationScript.delete()
+            }
+            update(VivoWiredStage.ActivatingKernelSu, "正在激活 KernelSU")
+            val activation = client.shell(
+                "chmod 0700 '$REMOTE_ACTIVATION_SCRIPT' && " +
+                    "$suPath -c 'sh $REMOTE_ACTIVATION_SCRIPT'",
+            )
+            if (activation.output.isNotBlank()) log(activation.output)
+            if (activation.exitCode != 0) {
+                throw IOException("KernelSU 激活脚本退出码=${activation.exitCode}")
+            }
+
+            client.shell("rm -f -- '$REMOTE_PAYLOAD'")
+            state = state.copy(
+                stage = VivoWiredStage.Done,
+                running = false,
+                status = "目标设备提权完成",
+                success = true,
+            )
+            log("vivo/iQOO 有线提权流程完成")
+        } catch (cancelled: CancellationException) {
+            state = state.copy(
+                stage = VivoWiredStage.Idle,
+                running = false,
+                status = "操作已停止",
+                success = false,
+            )
+            log("操作已停止")
+            throw cancelled
+        } catch (error: Throwable) {
+            val reason = error.message?.takeIf(String::isNotBlank) ?: error.javaClass.simpleName
+            state = state.copy(
+                stage = VivoWiredStage.Failed,
+                running = false,
+                status = reason,
+                success = false,
+            )
+            log("失败：$reason")
+        } finally {
+            payloadFile?.delete()
+            runCatching { client?.shell("rm -f -- '$REMOTE_PAYLOAD'") }
+            runCatching { client?.close() }
+            publish(state)
+        }
+    }
+
+    private suspend fun pushFileWithRetry(
+        initialClient: UsbAdbClient,
+        source: File,
+        destination: String,
+        mode: Int? = null,
+    ): UsbAdbClient {
+        var client = initialClient
+        var resumeRemoteParts = false
+        val completedPartIndices = linkedSetOf<Int>()
+        val deferredPartIndices = linkedSetOf<Int>()
+        val partFailures = mutableMapOf<Int, Int>()
+        var transportFailures = 0
+        var reconnects = 0
+        while (true) {
+            try {
+                if (mode == null) {
+                    client.push(
+                        source = source,
+                        destination = destination,
+                        resumeRemoteParts = resumeRemoteParts,
+                        completedPartIndices = completedPartIndices,
+                        deferredPartIndices = deferredPartIndices,
+                        onLog = ::log,
+                        onProgress = ::publishTransferProgress,
+                    )
+                } else {
+                    client.push(
+                        source = source,
+                        destination = destination,
+                        mode = mode,
+                        resumeRemoteParts = resumeRemoteParts,
+                        completedPartIndices = completedPartIndices,
+                        deferredPartIndices = deferredPartIndices,
+                        onLog = ::log,
+                        onProgress = ::publishTransferProgress,
+                    )
+                }
+                return client
+            } catch (error: UsbAdbClient.TransportException) {
+                val interruptedPart = error.transferPartIndex
+                if (interruptedPart != null) {
+                    val failures = (partFailures[interruptedPart] ?: 0) + 1
+                    partFailures[interruptedPart] = failures
+                    deferredPartIndices += interruptedPart
+                    log(
+                        "分片${interruptedPart.toString().padStart(5, '0')} 已标记为延后处理，" +
+                            "先继续后续分片（失败$failures/$SAME_PART_TRANSFER_ATTEMPTS）",
+                    )
+                    if (failures >= SAME_PART_TRANSFER_ATTEMPTS) throw error
+                } else {
+                    transportFailures += 1
+                }
+                reconnects += 1
+                if (transportFailures >= SAME_PART_TRANSFER_ATTEMPTS || reconnects >= MAX_FILE_TRANSFER_RECONNECTS) {
+                    throw error
+                }
+                log("USB ADB 传输中断，关闭失效会话并重新建立 ADB transport")
+                runCatching { client.close() }
+                client = connectTarget(false)
+                log("ADB transport 已重新握手，继续未完成分片")
+                resumeRemoteParts = true
+            }
+        }
+    }
+
+    fun reset() {
+        state = VivoWiredProgress()
+        publish(state)
+    }
+
+    fun clearLogs() {
+        state = state.copy(logs = emptyList())
+        publish(state)
+    }
+
+    private suspend fun waitForBootCompleted(initialClient: UsbAdbClient): UsbAdbClient {
+        var client = initialClient
+        var transportRebuilt = false
+        var bootValueLogged = false
+        var lastShellError: IOException? = null
+        repeat(BOOT_WAIT_ATTEMPTS) {
+            val result = try {
+                client.shell("getprop sys.boot_completed")
+            } catch (error: UsbAdbClient.ServiceRejectedException) {
+                lastShellError = error
+                if (transportRebuilt) {
+                    throw IOException("ADB 已完成握手，但 Shell 服务仍拒绝请求（A_CLSE）", error)
+                }
+                log("ADB 已完成握手，但当前 transport 拒绝 Shell；重建 ADB transport")
+                client.close()
+                client = connectTarget(true)
+                transportRebuilt = true
+                log("已建立新的 ADB transport，继续读取启动状态")
+                return@repeat
+            } catch (error: UsbAdbClient.TransportException) {
+                lastShellError = error
+                if (transportRebuilt) {
+                    throw IOException("ADB transport 在启动检查期间再次断开", error)
+                }
+                log("ADB transport 已断开；重建 ADB transport 后继续读取启动状态")
+                client.close()
+                client = connectTarget(true)
+                transportRebuilt = true
+                return@repeat
+            } catch (error: IOException) {
+                lastShellError = error
+                throw error
+            }
+            val bootValue = result.output.trim()
+            if (bootValue == "1") return client
+            if (!bootValueLogged) {
+                log("sys.boot_completed=$bootValue，设备仍在启动")
+                bootValueLogged = true
+            }
+            delay(BOOT_WAIT_INTERVAL_MS)
+        }
+        val detail = lastShellError?.message?.takeIf(String::isNotBlank)?.let { "：$it" }.orEmpty()
+        throw IOException("等待目标设备启动超时$detail")
+    }
+
+    private suspend fun collectTargetProfile(client: UsbAdbClient): DeviceProfile {
+        val properties = parseGetProp(shellWithRetry(client, "getprop", "设备属性").output)
+        fun first(vararg names: String): String = names.firstNotNullOfOrNull { name ->
+            properties[name]?.trim()?.takeIf(String::isNotBlank)
+        }.orEmpty()
+
+        val brand = first("ro.product.brand", "ro.product.manufacturer", "ro.product.vendor.brand")
+        val model = first(
+            "ro.vivo.market.name",
+            "ro.vivo.product.model",
+            "ro.product.marketname",
+            "ro.product.model",
+            "ro.product.vendor.model",
+        )
+        val system = first(
+            "ro.build.version.bbk",
+            "ro.vivo.os.build.display.id",
+            "ro.vivo.rom.version",
+            "ro.vivo.os.version",
+            "ro.build.version.incremental",
+            "ro.build.display.id",
+        )
+        val kernel = shellWithRetry(client, "uname -r", "内核信息").output.trim()
+        if (brand.isBlank() || model.isBlank() || system.isBlank() || kernel.isBlank()) {
+            throw IOException("目标设备信息读取不完整")
+        }
+        return DeviceProfile(brand, model, system, kernel)
+    }
+
+    private suspend fun shellWithRetry(
+        client: UsbAdbClient,
+        command: String,
+        description: String,
+    ): UsbAdbClient.CommandResult {
+        var lastError: IOException? = null
+        repeat(SHELL_RETRY_ATTEMPTS) { attempt ->
+            try {
+                return client.shell(command)
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt == 0) {
+                    log("目标设备 ADB Shell 尚未就绪，等待${description}服务")
+                }
+                delay(SHELL_RETRY_INTERVAL_MS)
+            }
+        }
+        val detail = lastError?.message?.takeIf(String::isNotBlank)?.let { "：$it" }.orEmpty()
+        throw IOException("ADB Shell 服务未就绪$detail")
+    }
+
+    private fun parseGetProp(output: String): Map<String, String> = buildMap {
+        output.lineSequence().forEach { line ->
+            val match = GETPROP_LINE.matchEntire(line.trim()) ?: return@forEach
+            put(match.groupValues[1], match.groupValues[2])
+        }
+    }
+
+    private fun requireVivo(profile: DeviceProfile) {
+        val identity = "${profile.brandName} ${profile.modelName}".lowercase()
+        if (VIVO_IDENTITIES.none(identity::contains)) {
+            throw IOException("该入口仅支持 vivo/iQOO 目标设备")
+        }
+    }
+
+    private suspend fun requestPayload(profile: DeviceProfile): WiredPayload {
+        return when (val result = awaitCompatibility(profile)) {
+            CompatibilityResult.EndpointNotConfigured -> throw IOException("提权文件接口尚未配置")
+            CompatibilityResult.DeviceNotSupported -> throw IOException("服务端没有匹配该 vivo/iQOO 设备的提权文件")
+            is CompatibilityResult.Failure -> throw IOException("服务端请求失败：${result.reason}")
+            is CompatibilityResult.Success -> parsePayload(result.responseBody)
+        }
+    }
+
+    private suspend fun downloadPayload(payload: WiredPayload): File {
+        val original = payload.resource
+        var candidate = original
+        var lastError: IOException? = null
+        repeat(MAX_DOWNLOAD_ROUTE_ATTEMPTS) {
+            try {
+                var progressBucket = -1
+                val file = downloader.download(candidate) { progress ->
+                    val nextBucket = (progress.percent / 10) * 10
+                    if (nextBucket != progressBucket) {
+                        progressBucket = nextBucket
+                        log("${candidate.routeName} 下载进度：${progress.percent}%")
+                    }
+                }
+                if (!awaitDownloadConfirmation(
+                        payload.payloadId,
+                        candidate.sessionId,
+                        candidate.attemptId,
+                    )
+                ) {
+                    log("下载成功，但线路统计确认未送达")
+                }
+                return file
+            } catch (error: IOException) {
+                lastError = error
+                log("线路 ${candidate.routeName} 下载失败，正在切换线路")
+                val next = when (val ticket = awaitNextTicket(
+                    payload.payloadId,
+                    candidate.sessionId,
+                    candidate.attemptId,
+                    downloadFailureReason(error),
+                )) {
+                    is ResourceTicketResult.Success -> ticket
+                    ResourceTicketResult.Exhausted -> throw IOException("所有提权文件线路均已尝试", error)
+                    is ResourceTicketResult.Failure -> throw IOException("切换下载线路失败：${ticket.reason}", error)
+                }
+                if (!next.sha256.equals(original.sha256, ignoreCase = true)) {
+                    throw IOException("新线路 SHA-256 与设备匹配结果不一致", error)
+                }
+                candidate = original.copy(
+                    url = next.url,
+                    route = next.route,
+                    routeName = next.routeName,
+                    sessionId = next.sessionId,
+                    attemptId = next.attemptId,
+                    hasMoreRoutes = next.hasMoreRoutes,
+                )
+            }
+        }
+        throw IOException("提权文件下载超过线路安全上限", lastError)
+    }
+
+    private fun parsePayload(body: String): WiredPayload {
+        val json = JSONObject(body)
+        if (json.optString("matchMode") != "exact") {
+            throw IOException("服务端未返回严格匹配结果")
+        }
+        val command = json.optString("payloadCommand").ifBlank { json.optString("payload_command") }
+        val payloadId = json.optString("payloadId").ifBlank { json.optString("payload_id") }.trim()
+        val suPath = json.optString("suPath")
+            .ifBlank { json.optString("su_path") }
+            .ifBlank { json.optString("stellar_su_path") }
+            .trim()
+        val resources = json.optJSONArray("resources") ?: throw IOException("服务端未返回提权文件")
+        if (payloadId.isBlank() || resources.length() != 1) throw IOException("服务端提权文件元数据无效")
+        val item = resources.getJSONObject(0)
+        val resource = PayloadResource(
+            name = item.optString("name").trim(),
+            url = item.optString("url").trim(),
+            sha256 = item.optString("sha256").trim().lowercase(),
+            size = item.optLong("size", 0L),
+            route = item.optString("route").trim(),
+            routeName = item.optString("routeName").trim().ifBlank { item.optString("route").trim() },
+            sessionId = item.optString("downloadSessionId").trim(),
+            attemptId = item.optString("downloadAttemptId").trim(),
+            hasMoreRoutes = item.optBoolean("hasMoreRoutes", false),
+        )
+        if (resource.name.isBlank() || resource.url.isBlank() ||
+            !SHA256_PATTERN.matches(resource.sha256) || resource.size !in 1..MAX_RESOURCE_BYTES ||
+            !STATE_ID_PATTERN.matches(resource.sessionId) || !STATE_ID_PATTERN.matches(resource.attemptId)
+        ) {
+            throw IOException("服务端提权文件元数据无效")
+        }
+        return WiredPayload(command.trim(), payloadId, suPath, resource)
+    }
+
+    private fun validateCommand(command: String, local: Boolean = false) {
+        if (command.isBlank() || command.toByteArray().size > MAX_COMMAND_BYTES ||
+            command.indexOf('\u0000') >= 0 || FORBIDDEN_COMMAND_PATTERN.containsMatchIn(command)
+        ) {
+            throw IOException(if (local) "本地提权命令无效" else "服务端返回的设备专属提权命令无效")
+        }
+    }
+
+    private fun validateSuPath(path: String) {
+        if (!SU_PATH_PATTERN.matches(path) || path.split('/').any { it == "." || it == ".." }) {
+            throw IOException("服务端返回的临时 su 路径无效")
+        }
+    }
+
+    private fun copyActivationScript(): File {
+        val target = File.createTempFile("yhroot-ksu-", ".sh", appContext.cacheDir)
+        return try {
+            appContext.assets.open(ACTIVATION_ASSET).use { input ->
+                FileOutputStream(target).use { output ->
+                    input.copyTo(output)
+                    output.fd.sync()
+                }
+            }
+            target
+        } catch (error: Throwable) {
+            target.delete()
+            throw error
+        }
+    }
+
+    private fun copyLocalPayload(uri: Uri): File {
+        val target = File.createTempFile("yhroot-wired-local-", ".bin", appContext.cacheDir)
+        return try {
+            val input = appContext.contentResolver.openInputStream(uri)
+                ?: throw IOException("本地提权文件无法读取")
+            var total = 0L
+            input.use { source ->
+                FileOutputStream(target).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val count = source.read(buffer)
+                        if (count < 0) break
+                        if (count == 0) continue
+                        total += count
+                        if (total > MAX_RESOURCE_BYTES) {
+                            throw IOException("本地提权文件超过大小上限")
+                        }
+                        output.write(buffer, 0, count)
+                    }
+                    output.fd.sync()
+                }
+            }
+            if (total == 0L) throw IOException("本地提权文件为空")
+            target
+        } catch (error: Throwable) {
+            target.delete()
+            throw error
+        }
+    }
+
+    private suspend fun awaitCompatibility(profile: DeviceProfile): CompatibilityResult =
+        suspendCancellableCoroutine { continuation ->
+            compatibilityApi.check(profile) { result ->
+                if (continuation.isActive) continuation.resume(result)
+            }
+        }
+
+    private suspend fun awaitNextTicket(
+        resourceId: String,
+        sessionId: String,
+        attemptId: String,
+        reason: String,
+    ): ResourceTicketResult = suspendCancellableCoroutine { continuation ->
+        compatibilityApi.requestNextTicket(resourceId, sessionId, attemptId, reason) { result ->
+            if (continuation.isActive) continuation.resume(result)
+        }
+    }
+
+    private suspend fun awaitDownloadConfirmation(
+        resourceId: String,
+        sessionId: String,
+        attemptId: String,
+    ): Boolean = suspendCancellableCoroutine { continuation ->
+        compatibilityApi.confirmResourceDownload(resourceId, sessionId, attemptId) { result ->
+            if (continuation.isActive) continuation.resume(result)
+        }
+    }
+
+    private fun downloadFailureReason(error: IOException): String {
+        val message = error.message.orEmpty().lowercase()
+        return when {
+            "sha-256" in message || "sha256" in message -> "sha256_mismatch"
+            "size mismatch" in message -> "size_mismatch"
+            "timeout" in message || "timed out" in message -> "timeout"
+            "http " in message -> "http_error"
+            else -> "download_failed"
+        }
+    }
+
+    private fun update(stage: VivoWiredStage, status: String) {
+        state = state.copy(
+            stage = stage,
+            running = true,
+            status = status,
+            transferProgress = null,
+            success = false,
+        )
+        publish(state)
+    }
+
+    private fun publishTransferProgress(transferredBytes: Long, totalBytes: Long) {
+        if (totalBytes <= 0L) return
+        val percent = ((transferredBytes.coerceIn(0L, totalBytes) * 100L) / totalBytes)
+            .toInt()
+            .coerceIn(0, 100)
+        if (state.transferProgress == percent) return
+        state = state.copy(
+            transferProgress = percent,
+            status = when (state.stage) {
+                VivoWiredStage.ActivatingKernelSu -> "正在传输 KernelSU 激活脚本（$percent%）"
+                else -> "正在传输提权文件（$percent%）"
+            },
+        )
+        publish(state)
+    }
+
+    private fun setTarget(profile: DeviceProfile) {
+        state = state.copy(target = "${profile.brandName} ${profile.modelName} · ${profile.systemVersion}")
+        publish(state)
+    }
+
+    private fun log(message: String) {
+        val added = message.lineSequence().filter(String::isNotBlank).map { "[有线提权] $it" }.toList()
+        state = state.copy(logs = (state.logs + added).takeLast(MAX_LOG_LINES))
+        publish(state)
+    }
+
+    override fun close() {
+        compatibilityApi.close()
+        downloader.close()
+    }
+
+    private data class WiredPayload(
+        val command: String,
+        val payloadId: String,
+        val suPath: String,
+        val resource: PayloadResource,
+    )
+
+    private companion object {
+        val GETPROP_LINE = Regex("^\\[([^]]+)]\\s*:\\s*\\[(.*)]$")
+        val VIVO_IDENTITIES = listOf("vivo", "iqoo", "bbk")
+        val ROOT_UID_PATTERN = Regex("(?:^|\\s)uid=0(?:\\(root\\))?(?:\\s|\\z)")
+        val FORBIDDEN_COMMAND_PATTERN = Regex("[;\\r\\n&]|\\|\\|")
+        val SU_PATH_PATTERN = Regex("^/(?:[A-Za-z0-9_+@.-]+/)*[A-Za-z0-9_+@.-]+$")
+        val SHA256_PATTERN = Regex("^[a-f0-9]{64}$")
+        val STATE_ID_PATTERN = Regex("^[a-f0-9]{24,64}$")
+        const val MAX_COMMAND_BYTES = 1024
+        const val MAX_RESOURCE_BYTES = 512L * 1024L * 1024L
+        const val MAX_DOWNLOAD_ROUTE_ATTEMPTS = 32
+        const val MAX_LOG_LINES = 1_500
+        const val BOOT_WAIT_ATTEMPTS = 90
+        const val BOOT_WAIT_INTERVAL_MS = 2_000L
+        const val SHELL_RETRY_ATTEMPTS = 30
+        const val SHELL_RETRY_INTERVAL_MS = 1_000L
+        const val SAME_PART_TRANSFER_ATTEMPTS = 12
+        const val MAX_FILE_TRANSFER_RECONNECTS = 64
+        const val REBOOT_DISCONNECT_GRACE_MS = 3_000L
+        const val POST_BOOT_COMMAND_DELAY_MS = 5_000L
+        const val REMOTE_PAYLOAD = "/data/local/tmp/preload.so"
+        const val LOCAL_PAYLOAD_SU_PATH = "/data/local/tmp/su"
+        const val REMOTE_ACTIVATION_SCRIPT = "/data/local/tmp/yhroot_ksu_activate.sh"
+        const val ACTIVATION_SCRIPT_MODE = 0x81C0 // regular file + 0700
+        const val ACTIVATION_ASSET = "yhroot_ksu_activate.sh"
+    }
+}

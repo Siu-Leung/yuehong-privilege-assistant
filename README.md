@@ -3,7 +3,7 @@
 月虹提权助手是一个内置 Stellar Manager、Server 与 API 的 Android 提权工作台。应用不再依赖外部 Shizuku 或外部 Stellar 管理器，可直接在应用内通过 Android 无线调试完成 Stellar 自激活，再使用 `Stellar.newProcess()` 执行命令。
 
 - 应用 ID：`roro.stellar.yuehong`
-- 版本：`v1.2`（`versionCode 120`）
+- 版本：`v1.5.3`（`versionCode 153`）
 - 最低系统：Android 9（API 28）
 - 目标系统：Android API 37
 - ABI：`arm64-v8a`
@@ -15,7 +15,7 @@
 3. 服务未启动时进入应用内无线调试自激活页；配对、连接和服务启动均由内置 Stellar 组件完成。
 4. 服务已启动但权限未确认时，使用 Stellar 自身授权页完成显式授权。
 5. 授权后进入命令工作台，终端、在线提权和本地提权文件都通过 `Stellar.newProcess()` 执行。
-6. 在线提权继续使用 DMKPZ 精确设备匹配、签名响应和多线路资源回退；本地文件模式完全不请求服务器。
+6. 在线提权继续使用构建者自有服务端的精确设备匹配、签名响应和多线路资源回退；本地文件模式完全不请求服务器。
 7. 提权成功后可按原流程检测并激活 KernelSU；KernelSU 接管后的 `su` 不可用时立即停止后续命令。
 
 应用保留正式版包名；使用相同证书签名时可覆盖安装现有正式版。公开源码不附带发行证书。整合工程未使用 Stellar 上游的 `sharedUserId`。
@@ -91,8 +91,8 @@ Windows 中文路径下请使用工程自带脚本。脚本会创建一个仅在
 Release 签名读取根目录下由构建者自行创建的 `keystore.properties`；公开源码不附带任何发行密钥或签名属性。主要产物会同步到：
 
 ```text
-out/apk/月虹提权助手-v1.2-release.apk
-out/mapping/mapping-v1.2.txt
+out/apk/月虹提权助手-v1.5.3-release.apk
+out/mapping/mapping-v1.5.3.txt
 ```
 
 ## 安全边界

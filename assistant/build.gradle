@@ -24,8 +24,8 @@ android {
         minSdk 28
 
         buildConfigField 'String', 'APPLICATION_ID', '"roro.stellar.yuehong"'
-        buildConfigField 'int', 'VERSION_CODE', '120'
-        buildConfigField 'String', 'VERSION_NAME', '"v1.2"'
+        buildConfigField 'int', 'VERSION_CODE', rootProject.ext.yuehongVersionCode.toString()
+        buildConfigField 'String', 'VERSION_NAME', buildConfigString(rootProject.ext.yuehongVersionName.toString())
         buildConfigField 'String', 'SERVER_COMPATIBILITY_ENDPOINT', buildConfigString(serverProperty('compatibilityEndpoint'))
         buildConfigField 'String', 'SERVER_MODULE_ID', buildConfigString(serverProperty('moduleId'))
         buildConfigField 'String', 'SERVER_PROTOCOL_V2_ENDPOINT', buildConfigString(serverProperty('protocolV2Endpoint'))
@@ -44,6 +44,12 @@ android {
     buildFeatures {
         compose true
         buildConfig true
+    }
+
+    packagingOptions {
+        jniLibs {
+            keepDebugSymbols += ["**/libbs.so", "**/libionstack.so", "**/libcve43499root.so"]
+        }
     }
 
     kotlin {

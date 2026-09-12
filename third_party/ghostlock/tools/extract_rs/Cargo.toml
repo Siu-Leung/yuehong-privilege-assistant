@@ -26,8 +26,6 @@ package = "payload-extract"
 git = "https://github.com/YuKongA/payload_extract_rs"
 rev = "5534f07298d9f366d6a71daf52cb09141ed96a8a"
 default-features = false
-# OTA 完整包链接依赖 HTTP Range 读取远端 ZIP 中的 payload.bin；
-# 使用 Rustls 避免 Android 端依赖系统 OpenSSL/native-tls。
 features = ["http-rustls"]
 
 [dev-dependencies]

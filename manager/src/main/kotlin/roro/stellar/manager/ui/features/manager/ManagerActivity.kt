@@ -107,8 +107,7 @@ class ManagerActivity : ComponentActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    // 返回键仅把任务移到后台，保留 Stellar 的运行状态。
-                    moveTaskToBack(true)
+                    finish()
                 }
             },
         )
