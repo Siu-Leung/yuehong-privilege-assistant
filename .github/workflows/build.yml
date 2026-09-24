@@ -26,14 +26,13 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Accept Android SDK Licenses & Install Components
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager --install "build-tools;36.0.0" "ndk;29.0.13113456" "cmake;3.22.1" || true
-          sdkmanager --install "platforms;android-37" || sdkmanager --install "platforms;android-36" || true
+          SDKMANAGER=$(find $ANDROID_HOME/cmdline-tools -name sdkmanager | sort -V | tail -n 1)
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | $SDKMANAGER --licenses || true
+          $SDKMANAGER --install "build-tools;36.0.0" "ndk;29.0.13113456" "cmake;3.22.1" || true
+          $SDKMANAGER --install "platforms;android-37" || $SDKMANAGER --install "platforms;android-36" || true
 
       - name: Prepare server.properties
         run: |
