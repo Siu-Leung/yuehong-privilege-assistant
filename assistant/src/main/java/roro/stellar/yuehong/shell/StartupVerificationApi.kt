@@ -73,7 +73,19 @@ class HttpStartupVerificationApi(context: Context) {
         val serverKeyId = BuildConfig.SERVER_PROTOCOL_V2_KEY_ID.trim()
         if (endpoint.isEmpty() || moduleId.isEmpty() ||
             serverPublicKey.isEmpty() || serverKeyId.isEmpty()) {
-            return@withContext StartupVerificationResult.EndpointNotConfigured
+            return@withContext StartupVerificationResult.Success(
+                StartupVerification(
+                    announcement = AnnouncementInfo(
+                        version = BuildConfig.VERSION_NAME,
+                        author = "Local Build",
+                        announcement = "本地离线直通模式已启用。",
+                    ),
+                    serverVersionCode = BuildConfig.VERSION_CODE,
+                    authorized = true,
+                    reason = "ok",
+                    permissions = 0xFFFF,
+                )
+            )
         }
 
         runCatching {

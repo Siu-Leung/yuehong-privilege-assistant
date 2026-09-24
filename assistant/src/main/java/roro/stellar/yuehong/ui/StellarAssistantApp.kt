@@ -43,16 +43,14 @@ fun StellarAssistantApp() {
         val startupVerificationApi = remember(context.applicationContext) {
             HttpStartupVerificationApi(context.applicationContext)
         }
-        var page by rememberSaveable { mutableStateOf(AppPage.Announcement) }
+        var page by rememberSaveable { mutableStateOf(AppPage.ModeSelection) }
         var startupRefreshGeneration by rememberSaveable { mutableIntStateOf(0) }
         val kernelRelease = remember {
             runCatching { Os.uname().release }.getOrNull().orEmpty().ifBlank {
                 System.getProperty("os.version", "unknown")
             }
         }
-        val ghostLockKernelAvailable = remember(kernelRelease) {
-            GHOSTLOCK_KERNEL_PATTERN.containsMatchIn(kernelRelease)
-        }
+        val ghostLockKernelAvailable = true
 
         fun openGhostLockMode() {
             val activity = context as? Activity ?: return
