@@ -2,6 +2,8 @@ package roro.stellar.yuehong.ghostlock
 
 import com.kernelpack.KernelPack
 import com.kernelpack.PackRequest
+import com.kernelpack.policy.GateDecision
+import com.kernelpack.profile.BaselineScheme
 import com.kernelpack.profile.BaselineProfiles
 import java.util.function.Consumer
 
@@ -20,12 +22,14 @@ object DynamicPayloadEngine {
                 bootImage = boot,
                 baseLibrary = base,
                 baseline = BaselineProfiles.byId(baselineId),
+                scheme = if (baselineId.startsWith("PD2520-")) BaselineScheme.VIVO else BaselineScheme.UNIVERSAL,
                 log = { line -> logger.accept(line) },
             ),
         )
         return DynamicBuildResult(
             result.packedLibrary,
-            result.summary(),
+            (result.gate as? GateDecision.Blocked)?.let { "${it.title}: ${it.detail.joinToString("；")}" }
+                ?: result.summary(),
             result.warnings.joinToString("\n"),
         )
     }

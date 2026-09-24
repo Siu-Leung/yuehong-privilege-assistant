@@ -660,7 +660,7 @@ public class GhostLockActivity extends ComponentActivity {
                 File base = dynamicBaseLibrary;
                 if (base == null || !base.isFile()) base = selectPreferredDynamicPayload();
                 DynamicBuildResult result = DynamicPayloadEngine.build(java.nio.file.Files.readAllBytes(boot.toPath()), java.nio.file.Files.readAllBytes(base.toPath()), dynamicBaselineId, line -> appendLog("[KSuRoot] " + line));
-                if (result.getPayload() == null) throw new IOException("payload build returned no output");
+                if (result.getPayload() == null) throw new IOException(result.getSummary());
                 File built = new File(dir, "payload-patched.so");
                 try (FileOutputStream output = new FileOutputStream(built, false)) { output.write(result.getPayload()); }
                 appendLog(result.getSummary());

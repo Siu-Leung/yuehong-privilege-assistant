@@ -4,6 +4,7 @@
 
 - 应用 ID：`roro.stellar.yuehong`
 - 版本：`v1.5.3`（`versionCode 153`）
+- 版本：`v1.5.4`（`versionCode 154`）
 - 最低系统：Android 9（API 28）
 - 目标系统：Android API 37
 - ABI：`arm64-v8a`
@@ -94,6 +95,8 @@ Release 签名读取根目录下由构建者自行创建的 `keystore.properties
 ```text
 out/apk/月虹提权助手-v1.5.3-release.apk
 out/mapping/mapping-v1.5.3.txt
+out/apk/月虹提权助手-v1.5.4-release.apk
+out/mapping/mapping-v1.5.4.txt
 ```
 
 ## 安全边界
@@ -119,7 +122,7 @@ out/mapping/mapping-v1.5.3.txt
 
 启动验证与频道授权通过后，应用先进入提权模式选择页：
 
-- **内核 6.6 / 6.12 · GhostLock**：无需 Stellar 激活，按精确 `uname -r` 使用内置或导入 offsets；支持 `boot.img`、骁龙 `boot.img + xbl_config.img`、天玑 `boot.img` 与完整 OTA 链接。
+- **内核 6.1 / 6.6 / 6.12 · GhostLock**：无需 Stellar 激活，按精确 `uname -r` 使用内置或导入 offsets；支持 `boot.img`、骁龙 `boot.img + xbl_config.img`、天玑 `boot.img` 与完整 OTA 链接。
 - **通用提权助手 · Stellar**：继续保留机型匹配、服务端多线路提权文件、完全本地文件、自激活和命令控制台。
 
 GhostLock 完整上游源码固定在 `third_party/ghostlock`。更新其原生组件后执行：
